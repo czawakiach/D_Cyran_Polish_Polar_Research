@@ -1,0 +1,578 @@
+"""
+Snowfall Probability Analysis for Svalbard Glaciers
+===================================================
+
+This script calculates snowfall probability for two Svalbard glaciers (Hansbreen and Werenskiöldbreen)
+using temperature, precipitation, and elevation data. The analysis combines meteorological data from
+multiple stations with elevation corrections to estimate the likelihood of snowfall events.
+
+Author: [Your Name]
+Institution: [Your Institution]
+Date: [Date]
+Version: 1.0
+
+Data Sources:
+- Glacier temperature data from AWS stations (hans4, hans9, werenskiold)
+- Precipitation data from Hornsund station
+- Elevation data for topographic corrections
+
+Publication: [Your Publication Title/DOI when available]
+
+Dependencies:
+- pandas
+- numpy
+- matplotlib
+- seaborn
+- pathlib
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import os
+
+
+class SnowfallAnalyzer:
+    """
+    A class for analyzing snowfall probability on Svalbard glaciers.
+    
+    This analyzer combines temperature and precipitation data with elevation corrections
+    to calculate the probability of snowfall at different glacier locations. The methodology
+    uses sigmoid functions for temperature thresholds and logarithmic scaling for precipitation.
+    
+    Attributes:
+    -----------
+    base_path : Path
+        Base directory containing input data files
+    station_elevations : dict
+        Elevation data (m a.s.l.) for each monitoring station
+    hornsund_elevation : int
+        Reference elevation for precipitation measurements at Hornsund station
+    """
+    
+    def __init__(self, base_path):
+        """
+        Initialize the snowfall analyzer with data path and station metadata.
+        
+        Parameters:
+        -----------
+        base_path : str or Path
+            Base directory path containing the meteorological data files
+            Expected structure:
+            - {station}_{year}_daily_ready.csv (glacier temperature data)
+            - hornsund_{year}_precip.csv (precipitation data)
+        """
+        self.base_path = Path(base_path)
+        
+        # Station elevations in meters above sea level (m a.s.l.)
+        # These elevations are used for orographic precipitation corrections
+        self.station_elevations = {
+            'hans4': 190,      # Hansbreen station 4
+            'hans9': 420,      # Hansbreen station 9  
+            'werenskiold': 360 # Werenskiöldbreen station
+        }
+        
+        # Hornsund meteorological station elevation (reference for precipitation)
+        self.hornsund_elevation = 10
+        
+    def calculate_temperature_probability(self, temperature):
+        """
+        Calculate snowfall probability component based on air temperature.
+        
+        Uses a sigmoid (logistic) function to model the temperature-dependent probability
+        of snowfall. The function provides a smooth transition around the freezing point,
+        accounting for the fact that snowfall can occur slightly above 0°C due to factors
+        like humidity, wind, and atmospheric conditions.
+        
+        Mathematical formulation:
+        P_temp = 1 / (1 + exp(k * (T - T0)))
+        
+        Where:
+        - k = 1.5 (transition steepness parameter)
+        - T0 = 1.0°C (center point of temperature transition)
+        - T = air temperature in Celsius
+        
+        Parameters:
+        -----------
+        temperature : float or array-like
+            Air temperature in degrees Celsius
+        
+        Returns:
+        --------
+        float or array-like
+            Temperature-based probability component (0-1 scale)
+            - Values near 1: high probability (cold temperatures)
+            - Values near 0: low probability (warm temperatures)
+        """
+        k = 1.5   # Steepness parameter - controls transition sharpness
+        t0 = 1.0  # Temperature threshold (°C) - center of sigmoid transition
+        
+        return 1 / (1 + np.exp(k * (temperature - t0)))
+    
+    def calculate_precipitation_probability(self, precipitation):
+        """
+        Calculate snowfall probability component based on precipitation amount.
+        
+        This function uses a piecewise approach to model precipitation probability:
+        1. No precipitation (0 mm): 0% probability
+        2. Trace precipitation (>0 but <0.1 mm): 20% base probability
+        3. Measurable precipitation (≥0.1 mm): Logarithmic scaling up to 100%
+        
+        The logarithmic scaling reflects the physical relationship where light
+        precipitation has lower snowfall probability due to sublimation and
+        measurement uncertainties, while heavier precipitation increases the
+        likelihood of measurable snowfall accumulation.
+        
+        Parameters:
+        -----------
+        precipitation : float or array-like
+            Precipitation amount in millimeters (mm)
+        
+        Returns:
+        --------
+        float or array-like
+            Precipitation-based probability component (0-1 scale)
+        """
+        # Precipitation thresholds (mm)
+        min_threshold = 0.1  # Minimum measurable precipitation
+        max_threshold = 5.0  # Precipitation amount for maximum probability
+        
+        # Initialize probability array with zeros
+        result = np.zeros_like(precipitation, dtype=float)
+        
+        # Assign base probability for trace precipitation (0 < precip < 0.1 mm)
+        # This accounts for measurement uncertainty and sublimation effects
+        light_precip_mask = (precipitation > 0) & (precipitation < min_threshold)
+        result[light_precip_mask] = 0.2
+        
+        # Calculate probability for measurable precipitation using logarithmic scaling
+        # This reflects the non-linear relationship between precipitation intensity
+        # and snowfall accumulation probability
+        sig_precip_mask = precipitation >= min_threshold
+        if np.any(sig_precip_mask):
+            scaled_precip = (np.log10(precipitation[sig_precip_mask] / min_threshold) / 
+                           np.log10(max_threshold / min_threshold))
+            # Cap probability at 1.0 for very heavy precipitation
+            result[sig_precip_mask] = np.minimum(scaled_precip, 1.0)
+        
+        return result
+    
+    def adjust_for_elevation(self, data, station):
+        """
+        Apply orographic precipitation correction based on elevation difference.
+        
+        Orographic effects cause precipitation to increase with elevation due to
+        forced uplift and cooling of air masses. This method applies a standard
+        meteorological correction of 10% increase per 100m elevation gain.
+        
+        Note: Temperature is not adjusted as it is measured directly at each station.
+        Only precipitation data from the reference station (Hornsund) is corrected
+        to estimate conditions at the glacier monitoring stations.
+        
+        Parameters:
+        -----------
+        data : pd.DataFrame
+            DataFrame containing meteorological data with 'precipitation' column
+        station : str
+            Station identifier ('hans4', 'hans9', or 'werenskiold')
+                
+        Returns:
+        --------
+        pd.DataFrame
+            Data with elevation-corrected precipitation values
+        """
+        # Calculate elevation difference from reference station (Hornsund)
+        elevation_diff = self.station_elevations[station] - self.hornsund_elevation
+
+        # Create copy to avoid modifying original data
+        adjusted_data = data.copy()
+
+        # Apply orographic precipitation correction
+        # Standard rate: 10% increase per 100m elevation gain
+        if 'precipitation' in adjusted_data.columns:
+            correction_factor = 1 + (elevation_diff / 100) * 0.1
+            adjusted_data['precipitation'] = data['precipitation'] * correction_factor
+            
+        return adjusted_data
+
+    def process_station_data(self, station, year):
+        """
+        Process complete meteorological dataset for a single station and year.
+        
+        This is the main processing function that:
+        1. Loads glacier temperature data and precipitation data
+        2. Merges datasets by date
+        3. Applies elevation corrections
+        4. Calculates temperature and precipitation probability components
+        5. Computes final snowfall probability
+        6. Cleans up legacy columns from previous analyses
+        
+        Expected input file formats:
+        - Glacier data: {station}_{year}_daily_ready.csv
+          Required columns: date, TC (temperature), albedo, day_of_year
+        - Precipitation data: hornsund_{year}_precip.csv
+          Required columns: date, precipitation
+        
+        Parameters:
+        -----------
+        station : str
+            Station identifier ('hans4', 'hans9', or 'werenskiold')
+        year : int
+            Year to process (e.g., 2010, 2011, 2012)
+            
+        Returns:
+        --------
+        pd.DataFrame or None
+            Processed data with snowfall probabilities, or None if files missing
+            
+        Output columns:
+        - All original columns from glacier data
+        - precipitation: elevation-corrected precipitation (mm)
+        - snowfall_probability: final calculated probability (0-1)
+        """
+        # Construct file paths for input data
+        glacier_file = f"{station}_{year}_daily_ready.csv"
+        glacier_path = self.base_path / glacier_file
+        
+        precip_file = f"hornsund_{year}_precip.csv"
+        precip_path = self.base_path / precip_file
+        
+        # Verify input files exist
+        if not glacier_path.exists():
+            print(f"Warning: Glacier data file not found: {glacier_file}")
+            return None
+        if not precip_path.exists():
+            print(f"Warning: Precipitation data file not found: {precip_file}")
+            return None
+        
+        try:
+            # Load meteorological datasets
+            print(f"Loading glacier data: {glacier_file}")
+            glacier_data = pd.read_csv(glacier_path)
+            
+            print(f"Loading precipitation data: {precip_file}")
+            precip_data = pd.read_csv(precip_path)
+            
+            # Merge datasets on date column
+            # Left join ensures all glacier observation days are retained
+            merged_data = pd.merge(glacier_data, 
+                                 precip_data[['date', 'precipitation']], 
+                                 on='date', how='left')
+            
+            print(f"Merged dataset: {len(merged_data)} daily records")
+            
+            # Apply elevation corrections for orographic effects
+            adjusted_data = self.adjust_for_elevation(merged_data, station)
+            
+            # Calculate probability components
+            # Temperature component: sigmoid function around freezing point
+            temp_prob = self.calculate_temperature_probability(adjusted_data['TC'])
+            
+            # Precipitation component: logarithmic scaling of precipitation amount
+            precip_prob = self.calculate_precipitation_probability(adjusted_data['precipitation'])
+            
+            # Calculate final snowfall probability
+            # Multiplicative model assumes independence of temperature and precipitation effects
+            snowfall_prob = temp_prob * precip_prob
+            
+            # Clean up legacy columns from previous analysis versions
+            legacy_columns = ['snowfall_probable', 'significant_albedo_increase', 
+                            'snowfall_validated']
+            adjusted_data = adjusted_data.drop(columns=legacy_columns, errors='ignore')
+            
+            # Add calculated snowfall probability
+            adjusted_data['snowfall_probability'] = snowfall_prob
+            
+            print(f"Calculated snowfall probabilities: mean = {snowfall_prob.mean():.3f}, "
+                  f"max = {snowfall_prob.max():.3f}")
+            
+            return adjusted_data
+            
+        except Exception as e:
+            print(f"Error processing {station} {year}: {str(e)}")
+            return None
+    
+    def plot_station_analysis(self, data, station, year):
+        """
+        Generate comprehensive visualization of snowfall analysis results.
+        
+        Creates two main plots:
+        1. Time series with multiple variables (temperature, snowfall probability, albedo)
+        2. Temperature-precipitation scatter plot colored by snowfall probability
+        3. Validation plot: snowfall probability vs. observed albedo changes
+        
+        The visualizations help validate the snowfall probability model against
+        observed albedo changes, which serve as a proxy for actual snowfall events.
+        
+        Parameters:
+        -----------
+        data : pd.DataFrame
+            Processed station data with calculated probabilities
+        station : str
+            Station name for plot titles
+        year : int
+            Year for plot titles
+        """
+        # Set up the main figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
+        fig.suptitle(f'Snowfall Probability Analysis: {station.upper()} Station ({year})', 
+                    fontsize=16, fontweight='bold')
+        
+        # ==========================================
+        # Plot 1: Multi-variable time series
+        # ==========================================
+        
+        # Primary axis: Temperature (left y-axis)
+        color_temp = 'darkgreen'
+        ax1.plot(data['day_of_year'], data['TC'], color=color_temp, 
+                linewidth=1.5, label='Air Temperature', alpha=0.8)
+        ax1.set_xlabel('Day of Year')
+        ax1.set_ylabel('Temperature (°C)', color=color_temp, fontweight='bold')
+        ax1.tick_params(axis='y', labelcolor=color_temp)
+        ax1.grid(True, alpha=0.3)
+        
+        # Secondary axis: Snowfall probability (right y-axis)
+        ax1_prob = ax1.twinx()
+        color_prob = 'darkblue'
+        ax1_prob.plot(data['day_of_year'], data['snowfall_probability'], 
+                     color=color_prob, linewidth=2, label='Snowfall Probability', alpha=0.9)
+        ax1_prob.set_ylabel('Snowfall Probability', color=color_prob, fontweight='bold')
+        ax1_prob.tick_params(axis='y', labelcolor=color_prob)
+        ax1_prob.set_ylim(0, 1)
+        
+        # Tertiary axis: Albedo (far right y-axis)
+        ax1_albedo = ax1.twinx()
+        ax1_albedo.spines["right"].set_position(("axes", 1.08))  # Offset third axis
+        color_albedo = 'darkred'
+        ax1_albedo.plot(data['day_of_year'], data['albedo'], color=color_albedo,
+                       linewidth=1, label='Surface Albedo', alpha=0.7, linestyle='--')
+        ax1_albedo.set_ylabel('Albedo', color=color_albedo, fontweight='bold')
+        ax1_albedo.tick_params(axis='y', labelcolor=color_albedo)
+        ax1_albedo.set_ylim(0, 1)
+        
+        # Combine legends from all three axes
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax1_prob.get_legend_handles_labels()
+        lines3, labels3 = ax1_albedo.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, 
+                  loc='upper right', bbox_to_anchor=(0.85, 1))
+        
+        # ==========================================
+        # Plot 2: Temperature-Precipitation Phase Space
+        # ==========================================
+        
+        # Main scatter plot: color represents snowfall probability
+        scatter = ax2.scatter(data['TC'], data['precipitation'], 
+                            c=data['snowfall_probability'],
+                            cmap='RdYlBu_r', alpha=0.7, s=30)
+        
+        # Add colorbar for snowfall probability
+        cbar = plt.colorbar(scatter, ax=ax2, label='Snowfall Probability')
+        cbar.set_label('Snowfall Probability', fontweight='bold')
+        
+        # Overlay: albedo information using point size
+        # Larger points indicate higher albedo (potential snowfall validation)
+        sizes = 10 + data['albedo'] * 80  # Scale albedo to point sizes
+        ax2.scatter(data['TC'], data['precipitation'], s=sizes, 
+                   facecolors='none', edgecolors='red', alpha=0.3, linewidth=0.5,
+                   label='Albedo (point size)')
+        
+        # Plot formatting
+        ax2.set_xlabel('Air Temperature (°C)', fontweight='bold')
+        ax2.set_ylabel('Precipitation (mm)', fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc='upper right')
+        
+        # Add reference lines for typical snowfall conditions
+        ax2.axvline(x=0, color='gray', linestyle='--', alpha=0.5, label='Freezing point')
+        ax2.axvline(x=2, color='orange', linestyle='--', alpha=0.5, label='Snowfall threshold')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # ==========================================
+        # Plot 3: Model Validation Plot
+        # ==========================================
+        
+        plt.figure(figsize=(10, 7))
+        
+        # Scatter plot: snowfall probability vs. observed albedo
+        # Color points by temperature to show thermal conditions
+        validation_scatter = plt.scatter(data['snowfall_probability'], data['albedo'], 
+                                       c=data['TC'], cmap='coolwarm', alpha=0.6, s=40)
+        
+        # Add colorbar for temperature
+        cbar_val = plt.colorbar(validation_scatter, label='Air Temperature (°C)')
+        cbar_val.set_label('Air Temperature (°C)', fontweight='bold')
+        
+        # Plot formatting
+        plt.xlabel('Calculated Snowfall Probability', fontweight='bold')
+        plt.ylabel('Observed Surface Albedo', fontweight='bold')
+        plt.title(f'Model Validation: Snowfall Probability vs. Albedo\n'
+                 f'{station.upper()} Station ({year})', fontweight='bold')
+        plt.grid(True, alpha=0.3)
+        
+        # Add correlation information
+        correlation = np.corrcoef(data['snowfall_probability'], data['albedo'])[0, 1]
+        plt.text(0.05, 0.95, f'Correlation: r = {correlation:.3f}', 
+                transform=plt.gca().transAxes, fontsize=12, 
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print summary statistics for analysis
+        print(f"\n{'='*50}")
+        print(f"ANALYSIS SUMMARY: {station.upper()} {year}")
+        print(f"{'='*50}")
+        print(f"Total observations: {len(data)}")
+        print(f"Mean snowfall probability: {data['snowfall_probability'].mean():.3f}")
+        print(f"High probability days (>0.5): {(data['snowfall_probability'] > 0.5).sum()}")
+        print(f"Very high probability days (>0.8): {(data['snowfall_probability'] > 0.8).sum()}")
+        print(f"Temperature range: {data['TC'].min():.1f}°C to {data['TC'].max():.1f}°C")
+        print(f"Total precipitation: {data['precipitation'].sum():.1f} mm")
+        print(f"Probability-Albedo correlation: {correlation:.3f}")
+
+
+def main():
+    """
+    Main execution function for batch processing of all stations and years.
+    
+    This function:
+    1. Sets up the data directory structure
+    2. Defines the stations and years to process
+    3. Processes each station-year combination
+    4. Saves results to organized output files
+    5. Generates visualization plots
+    
+    Expected directory structure:
+    base_path/
+    ├── hans4_2010_daily_ready.csv
+    ├── hans4_2011_daily_ready.csv
+    ├── hans9_2010_daily_ready.csv
+    ├── hans9_2011_daily_ready.csv
+    ├── werenskiold_2011_daily_ready.csv
+    ├── werenskiold_2012_daily_ready.csv
+    ├── hornsund_2010_precip.csv
+    ├── hornsund_2011_precip.csv
+    ├── hornsund_2012_precip.csv
+    └── processed_probability/  (output directory)
+    """
+    
+    # ==============================================
+    # Configuration and Setup
+    # ==============================================
+    
+    # Set base path for data files
+    # Update this path to match your local directory structure
+    base_path = Path(r"C:\Users\PC\PhD\2024_Hans_data\Albedo_Glacier_ML\processed_data\daily_ready")
+    
+    print("="*60)
+    print("SVALBARD GLACIER SNOWFALL PROBABILITY ANALYSIS")
+    print("="*60)
+    print(f"Data directory: {base_path}")
+    print(f"Processing started at: {pd.Timestamp.now()}")
+    
+    # Initialize the snowfall analyzer
+    analyzer = SnowfallAnalyzer(base_path)
+    
+    # Define stations and years for analysis
+    # Each station represents a different glacier monitoring location:
+    # - hans4, hans9: Hansbreen glacier (different elevations)
+    # - werenskiold: Werenskiöldbreen glacier
+    stations_years = {
+        'hans4': [2010, 2011],        # Hansbreen lower elevation
+        'hans9': [2010, 2011],        # Hansbreen higher elevation  
+        'werenskiold': [2011, 2012]   # Werenskiöldbreen
+    }
+    
+    # ==============================================
+    # Batch Processing Loop
+    # ==============================================
+    
+    successful_processing = 0
+    total_combinations = sum(len(years) for years in stations_years.values())
+    
+    for station, years in stations_years.items():
+        print(f"\n{'-'*40}")
+        print(f"PROCESSING STATION: {station.upper()}")
+        print(f"Elevation: {analyzer.station_elevations[station]} m a.s.l.")
+        print(f"{'-'*40}")
+        
+        for year in years:
+            print(f"\n  → Processing year {year}...")
+            
+            # Process the station data for this year
+            processed_data = analyzer.process_station_data(station, year)
+            
+            if processed_data is not None:
+                # ==============================================
+                # Save Processed Results
+                # ==============================================
+                
+                # Create output filename and directory
+                output_file = f"{station}_{year}_snowfall_probability.csv"
+                output_dir = base_path / "processed_probability"
+                output_path = output_dir / output_file
+                
+                # Ensure output directory exists
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Save processed data with metadata header
+                with open(output_path, 'w') as f:
+                    # Write metadata header
+                    f.write(f"# Snowfall Probability Analysis Results\n")
+                    f.write(f"# Station: {station} (elevation: {analyzer.station_elevations[station]} m)\n")
+                    f.write(f"# Year: {year}\n")
+                    f.write(f"# Processing date: {pd.Timestamp.now()}\n")
+                    f.write(f"# Method: Temperature-precipitation probability model\n")
+                    f.write(f"# Columns: original data + snowfall_probability (0-1 scale)\n")
+                    f.write("#\n")
+                
+                # Append the actual data
+                processed_data.to_csv(output_path, mode='a', index=False)
+                
+                print(f"    ✓ Results saved: {output_file}")
+                
+                # ==============================================
+                # Generate Visualizations
+                # ==============================================
+                
+                print(f"    → Generating plots...")
+                analyzer.plot_station_analysis(processed_data, station, year)
+                
+                successful_processing += 1
+                
+            else:
+                print(f"    ✗ Failed to process {station} {year}")
+    
+    # ==============================================
+    # Final Summary
+    # ==============================================
+    
+    print(f"\n{'='*60}")
+    print("PROCESSING COMPLETE")
+    print(f"{'='*60}")
+    print(f"Successfully processed: {successful_processing}/{total_combinations} station-year combinations")
+    print(f"Output directory: {base_path / 'processed_probability'}")
+    print(f"Completion time: {pd.Timestamp.now()}")
+    
+    if successful_processing < total_combinations:
+        print(f"\nWarning: {total_combinations - successful_processing} combinations failed.")
+        print("Check file paths and data availability.")
+
+
+# ==============================================
+# Script Execution
+# ==============================================
+
+if __name__ == "__main__":
+    """
+    Execute the main analysis when script is run directly.
+    
+    This allows the script to be imported as a module without running the analysis,
+    or executed directly to perform the complete batch processing.
+    """
+    main()
