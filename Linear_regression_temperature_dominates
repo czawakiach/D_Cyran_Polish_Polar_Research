@@ -1,0 +1,1093 @@
+"""
+Temperature-Dominated Linear Regression Model for Albedo Prediction on Svalbard Glaciers
+=======================================================================================
+
+This script implements an alternative machine learning approach to predict glacier surface
+albedo with emphasis on daily positive temperature as the primary driver. This model variant
+explores the relative importance of thermal vs. precipitation processes in controlling
+glacier surface albedo dynamics during the ablation season.
+
+Scientific Hypothesis:
+This version tests whether daily positive temperature (thermal forcing) is more predictive
+of albedo changes than snowfall probability, representing the competing effects of:
+- Thermal processes: Melting, surface energy balance, ice crystal metamorphism
+- Precipitation processes: Fresh snow accumulation, snowfall events
+
+Model Comparison Framework:
+- Version 1: Snowfall probability as primary driver (companion script)
+- Version 2: Daily positive temperature as primary driver (this script)
+- This allows quantitative comparison of thermal vs. precipitation controls
+
+Key Differences from Snowfall-Dominated Model:
+- Feature: 'daily_positive_temp' replaces 'TC' (general temperature)
+- Focus: Thermal energy input rather than instantaneous temperature
+- Hypothesis: Positive degree accumulation drives albedo better than snowfall
+
+Scientific Background:
+- Daily positive temperature: Cumulative thermal energy above 0°C
+- More relevant for ablation processes than instantaneous temperature
+- Captures sustained melting conditions vs. brief temperature fluctuations
+- Better represents surface energy balance effects on albedo
+
+Model Architecture:
+- Linear regression with thermal-focused features
+- Training: 2010 (hans4, hans9) + 2012 (werenskiold)
+- Testing: 2011 (independent year validation)
+- Season: Extended ablation period (April 8 - September 4)
+
+Features:
+- day_of_year: Seasonal radiation and atmospheric patterns
+- daily_positive_temp: Daily thermal energy input (°C)
+- pdd: Cumulative positive degree days (thermal history)
+- snowfall_probability: Precipitation-based albedo changes
+
+Author: Dominik Cyran
+Institution: University of Silesia in Katowice
+Date: 03/08/2025
+Version: 1.0
+
+Dependencies:
+- pandas, numpy, scikit-learn
+- matplotlib, seaborn
+- pathlib, datetime
+
+Related Scripts:
+- Snowfall-dominated regression model (comparison baseline)
+- Snowfall probability calculation script (feature generation)
+
+Publication: [Your Publication Title/DOI when available]
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.impute import SimpleImputer
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+
+
+def load_and_combine_data(train_files, test_files):
+    """
+    Load and combine meteorological datasets for thermal-focused albedo modeling.
+    
+    This function handles the data loading pipeline for comparing thermal vs. 
+    precipitation controls on glacier albedo. The separation of training and testing
+    datasets ensures temporal independence for robust model validation.
+    
+    Data Requirements:
+    - Daily meteorological observations from glacier AWS stations
+    - Thermal variables: daily_positive_temp, pdd (positive degree days)
+    - Precipitation variables: snowfall_probability
+    - Target variable: surface albedo measurements
+    - Temporal variables: day_of_year, date
+    - Spatial variables: station identifier
+    
+    Parameters:
+    -----------
+    train_files : list of str
+        Training dataset file paths (multi-year, excluding test year)
+        Expected format: {station}_{year}_processed_with_pdd.csv
+    test_files : list of str
+        Testing dataset file paths (independent validation year)
+        
+    Returns:
+    --------
+    tuple of pd.DataFrame
+        (train_df, test_df) - Temporally separated datasets for model validation
+    """
+    print("\n" + "="*50)
+    print("LOADING THERMAL-FOCUSED DATASETS")
+    print("="*50)
+    
+    # Load and concatenate training datasets
+    train_dfs = []
+    for file_path in train_files:
+        try:
+            df = pd.read_csv(file_path)
+            print(f"✓ Loaded training: {file_path} ({len(df)} records)")
+            
+            # Verify required thermal columns exist
+            required_thermal_cols = ['daily_positive_temp', 'pdd']
+            missing_cols = [col for col in required_thermal_cols if col not in df.columns]
+            if missing_cols:
+                print(f"  Warning: Missing thermal columns: {missing_cols}")
+            
+            train_dfs.append(df)
+        except FileNotFoundError:
+            print(f"✗ Training file not found: {file_path}")
+        except Exception as e:
+            print(f"✗ Error loading training file {file_path}: {e}")
+    
+    # Load and concatenate testing datasets
+    test_dfs = []
+    for file_path in test_files:
+        try:
+            df = pd.read_csv(file_path)
+            print(f"✓ Loaded testing: {file_path} ({len(df)} records)")
+            
+            # Verify thermal data consistency
+            if 'daily_positive_temp' in df.columns:
+                pos_temp_stats = df['daily_positive_temp'].describe()
+                print(f"  Daily positive temp range: {pos_temp_stats['min']:.1f} to {pos_temp_stats['max']:.1f}°C")
+            
+            test_dfs.append(df)
+        except FileNotFoundError:
+            print(f"✗ Testing file not found: {file_path}")
+        except Exception as e:
+            print(f"✗ Error loading testing file {file_path}: {e}")
+    
+    # Combine datasets
+    train_combined = pd.concat(train_dfs, ignore_index=True) if train_dfs else pd.DataFrame()
+    test_combined = pd.concat(test_dfs, ignore_index=True) if test_dfs else pd.DataFrame()
+    
+    print(f"\nDataset Summary:")
+    print(f"  Training records: {len(train_combined)}")
+    print(f"  Testing records: {len(test_combined)}")
+    
+    if len(train_combined) > 0:
+        print(f"  Training period: {train_combined['year'].min() if 'year' in train_combined else 'Unknown'}-"
+              f"{train_combined['year'].max() if 'year' in train_combined else 'Unknown'}")
+    if len(test_combined) > 0:
+        print(f"  Testing period: {test_combined['year'].min() if 'year' in test_combined else 'Unknown'}-"
+              f"{test_combined['year'].max() if 'year' in test_combined else 'Unknown'}")
+    
+    return train_combined, test_combined
+
+
+def filter_season(df, year_col='year', doy_col='day_of_year'):
+    """
+    Apply seasonal filtering optimized for thermal albedo processes.
+    
+    The extended ablation season focuses on the period when thermal processes
+    have maximum impact on glacier surface albedo. This seasonal window captures:
+    - Peak solar radiation input
+    - Maximum temperature variability
+    - Primary ice/snow metamorphism period
+    - Optimal signal-to-noise ratio for thermal-albedo relationships
+    
+    Thermal Process Considerations:
+    - April 8: Onset of sustained positive temperatures
+    - September 4: End of significant solar heating
+    - Excludes winter with minimal thermal forcing
+    - Maximizes temperature gradient effects on albedo
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input dataset with temporal columns
+    year_col : str, default 'year'
+        Column containing year information
+    doy_col : str, default 'day_of_year'
+        Column containing day of year (1-365/366)
+    
+    Returns:
+    --------
+    pd.DataFrame
+        Seasonally filtered dataset optimized for thermal analysis
+    """
+    # Define thermal season boundaries
+    spring_start_doy = 98   # April 8th - onset of thermal forcing
+    end_date_doy = 247      # September 4th - end of significant solar input
+    
+    # Apply seasonal mask
+    season_mask = (df[doy_col] >= spring_start_doy) & (df[doy_col] <= end_date_doy)
+    filtered_df = df[season_mask].copy()
+    
+    print(f"\nThermal Season Filtering:")
+    print(f"  Original dataset: {len(df)} records")
+    print(f"  Filtered dataset: {len(filtered_df)} records ({len(filtered_df)/len(df)*100:.1f}%)")
+    print(f"  Season window: Day {spring_start_doy} (Apr 8) → Day {end_date_doy} (Sep 4)")
+    print(f"  Focus: Maximum thermal forcing period")
+    
+    # Analyze thermal characteristics of filtered data
+    if 'daily_positive_temp' in filtered_df.columns:
+        thermal_stats = filtered_df['daily_positive_temp'].describe()
+        print(f"  Thermal range: {thermal_stats['min']:.1f}°C to {thermal_stats['max']:.1f}°C")
+        print(f"  Mean daily positive temp: {thermal_stats['mean']:.1f}°C")
+    
+    return filtered_df
+
+
+def prepare_data(train_files, test_files):
+    """
+    Comprehensive data preparation for temperature-dominated albedo prediction.
+    
+    This preparation pipeline is specifically designed for thermal process analysis:
+    1. Load datasets with thermal variable validation
+    2. Apply seasonal filtering for optimal thermal signal
+    3. Define thermal-focused feature set
+    4. Handle missing values with thermal-aware imputation
+    5. Prepare clean datasets for thermal modeling
+    
+    Thermal Feature Engineering:
+    - daily_positive_temp: Primary thermal driver (replaces general temperature)
+    - pdd: Cumulative thermal history (memory effect)
+    - day_of_year: Seasonal thermal patterns
+    - snowfall_probability: Competing precipitation effects
+    
+    Missing Value Strategy:
+    - Mean imputation preserves thermal distributions
+    - Maintains physical relationships between thermal variables
+    - Handles gaps in automated weather station data
+    
+    Parameters:
+    -----------
+    train_files : list of str
+        Training data paths (thermal calibration period)
+    test_files : list of str
+        Testing data paths (thermal validation period)
+    
+    Returns:
+    --------
+    tuple
+        X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_df
+        Cleaned datasets ready for thermal albedo modeling
+    """
+    print("\n" + "="*50)
+    print("THERMAL-FOCUSED DATA PREPARATION")
+    print("="*50)
+    
+    # Load datasets with thermal validation
+    train_df, test_df = load_and_combine_data(train_files, test_files)
+    
+    # Apply seasonal filtering for thermal optimization
+    train_df = filter_season(train_df)
+    test_df = filter_season(test_df)
+    
+    # Define thermal-focused feature set
+    # Prioritizes thermal processes while retaining precipitation comparison
+    feature_cols = [
+        'day_of_year',          # Seasonal thermal patterns (solar angle, day length)
+        'daily_positive_temp',  # PRIMARY: Daily thermal energy input (°C)
+        'pdd',                  # Cumulative thermal history (degree-days)
+        'snowfall_probability'  # Competing precipitation effects for comparison
+    ]
+    
+    print(f"\nThermal Feature Set:")
+    for i, feature in enumerate(feature_cols, 1):
+        if feature == 'daily_positive_temp':
+            print(f"  {i}. {feature} ← PRIMARY THERMAL DRIVER")
+        elif feature == 'pdd':
+            print(f"  {i}. {feature} ← Thermal memory/history")
+        elif feature == 'snowfall_probability':
+            print(f"  {i}. {feature} ← Precipitation comparison")
+        else:
+            print(f"  {i}. {feature} ← Seasonal patterns")
+    
+    # Extract features and targets
+    X_train = train_df[feature_cols]
+    y_train = train_df['albedo']  # Target: surface reflectance (0-1)
+    
+    X_test = test_df[feature_cols]
+    y_test = test_df['albedo']
+    
+    # Thermal-aware missing value imputation
+    # Mean strategy preserves thermal distribution characteristics
+    feature_imputer = SimpleImputer(strategy='mean')
+    
+    print(f"\nApplying thermal-aware imputation...")
+    X_train_clean = pd.DataFrame(
+        feature_imputer.fit_transform(X_train),
+        columns=X_train.columns,
+        index=X_train.index
+    )
+    X_test_clean = pd.DataFrame(
+        feature_imputer.transform(X_test),
+        columns=X_test.columns,
+        index=X_test.index
+    )
+    
+    # Handle missing albedo values (target variable)
+    target_imputer = SimpleImputer(strategy='mean')
+    y_train_clean = pd.Series(
+        target_imputer.fit_transform(y_train.values.reshape(-1, 1)).ravel(),
+        index=y_train.index
+    )
+    y_test_clean = pd.Series(
+        target_imputer.transform(y_test.values.reshape(-1, 1)).ravel(),
+        index=y_test.index
+    )
+    
+    # Data quality assessment with thermal focus
+    print(f"\nThermal Data Quality Assessment:")
+    print(f"{'='*40}")
+    
+    print(f"\nMissing values before imputation:")
+    missing_train = X_train.isna().sum()
+    for feature, missing_count in missing_train.items():
+        if missing_count > 0:
+            pct_missing = missing_count / len(X_train) * 100
+            status = "⚠ HIGH" if pct_missing > 10 else "✓ Low"
+            print(f"  {feature}: {missing_count} missing ({pct_missing:.1f}%) {status}")
+        else:
+            print(f"  {feature}: Complete data ✓")
+    
+    print(f"\nTarget variable (albedo):")
+    print(f"  Training missing: {y_train.isna().sum()}")
+    print(f"  Testing missing: {y_test.isna().sum()}")
+    
+    # Thermal variable statistics
+    if 'daily_positive_temp' in X_train_clean.columns:
+        thermal_stats = X_train_clean['daily_positive_temp'].describe()
+        print(f"\nThermal Statistics (Training):")
+        print(f"  Daily positive temp mean: {thermal_stats['mean']:.2f}°C")
+        print(f"  Daily positive temp std: {thermal_stats['std']:.2f}°C")
+        print(f"  Daily positive temp range: {thermal_stats['min']:.1f} to {thermal_stats['max']:.1f}°C")
+    
+    print(f"\nFinal Dataset Sizes:")
+    print(f"  Training samples: {len(X_train_clean)}")
+    print(f"  Testing samples: {len(X_test_clean)}")
+    print(f"  Features: {len(feature_cols)}")
+    
+    return X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_df
+
+
+def train_and_evaluate_model(X_train, X_test, y_train, y_test, test_data):
+    """
+    Train and evaluate temperature-dominated linear regression model.
+    
+    This function implements thermal-focused model training and evaluation:
+    1. Train linear regression with thermal emphasis
+    2. Generate predictions on independent thermal validation data
+    3. Calculate comprehensive performance metrics
+    4. Analyze thermal vs. precipitation feature importance
+    5. Assess spatial generalization across glacier sites
+    
+    Model Evaluation Philosophy:
+    - Primary focus: How well does daily positive temperature predict albedo?
+    - Secondary analysis: Relative importance vs. snowfall probability
+    - Spatial validation: Performance consistency across different glaciers
+    - Temporal validation: Generalization to independent years
+    
+    Thermal Process Interpretation:
+    - Positive coefficients: Higher temperature → Higher albedo (unexpected)
+    - Negative coefficients: Higher temperature → Lower albedo (expected melting)
+    - Magnitude: Sensitivity of albedo to thermal forcing
+    
+    Parameters:
+    -----------
+    X_train : pd.DataFrame
+        Training features with thermal emphasis
+    X_test : pd.DataFrame
+        Testing features for validation
+    y_train : pd.Series
+        Training albedo targets
+    y_test : pd.Series
+        Testing albedo targets
+    test_data : pd.DataFrame
+        Original test data for spatial analysis
+    
+    Returns:
+    --------
+    tuple
+        Complete model evaluation results including thermal interpretation
+    """
+    print("\n" + "="*50)
+    print("TEMPERATURE-DOMINATED MODEL TRAINING")
+    print("="*50)
+    
+    # Initialize and train thermal-focused linear regression
+    model = LinearRegression()
+    print("Training temperature-dominated linear regression...")
+    print("Primary hypothesis: Daily positive temperature drives albedo changes")
+    
+    model.fit(X_train, y_train)
+    
+    # Generate thermal predictions
+    y_pred = model.predict(X_test)
+    print("Generating thermal-based albedo predictions...")
+    
+    # Calculate comprehensive performance metrics
+    r2 = r2_score(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    mae = np.mean(np.abs(y_test - y_pred))
+    
+    print(f"\nThermal Model Performance:")
+    print(f"  R² Score: {r2:.3f}")
+    print(f"  RMSE: {rmse:.3f}")
+    print(f"  MAE: {mae:.3f}")
+    
+    # Station-specific thermal performance analysis
+    station_metrics = {}
+    print(f"\nSpatial Validation (Station-Specific Performance):")
+    
+    for station in test_data['station'].unique():
+        station_mask = test_data['station'] == station
+        station_y_test = y_test[station_mask]
+        station_y_pred = y_pred[station_mask]
+        
+        if len(station_y_test) > 1:
+            station_r2 = r2_score(station_y_test, station_y_pred)
+            station_rmse = np.sqrt(mean_squared_error(station_y_test, station_y_pred))
+            station_mae = np.mean(np.abs(station_y_test - station_y_pred))
+            
+            station_metrics[station] = {
+                'R2': station_r2,
+                'RMSE': station_rmse,
+                'MAE': station_mae,
+                'n_samples': len(station_y_test)
+            }
+            
+            # Assess thermal performance at this location
+            performance_quality = "Excellent" if station_r2 > 0.7 else "Good" if station_r2 > 0.5 else "Moderate" if station_r2 > 0.3 else "Poor"
+            
+            print(f"  {station} ({len(station_y_test)} samples):")
+            print(f"    R² = {station_r2:.3f} ({performance_quality})")
+            print(f"    RMSE = {station_rmse:.3f}")
+            print(f"    MAE = {station_mae:.3f}")
+        else:
+            print(f"  {station}: Insufficient data for evaluation")
+    
+    # Thermal feature importance analysis
+    feature_importance = dict(zip(X_train.columns, model.coef_))
+    
+    # Calculate normalized importance for comparison
+    abs_coefficients = np.abs(model.coef_)
+    normalized_importance = abs_coefficients / np.sum(abs_coefficients)
+    normalized_importance = dict(zip(X_train.columns, normalized_importance))
+    
+    print(f"\nThermal Feature Importance Analysis:")
+    print(f"  Model Intercept: {model.intercept_:.3f}")
+    
+    # Analyze thermal vs precipitation dominance
+    thermal_features = ['daily_positive_temp', 'pdd']
+    thermal_importance = sum(normalized_importance.get(f, 0) for f in thermal_features)
+    precip_importance = normalized_importance.get('snowfall_probability', 0)
+    
+    print(f"\nProcess Dominance Assessment:")
+    print(f"  Thermal processes: {thermal_importance:.1%} of total importance")
+    print(f"  Precipitation processes: {precip_importance:.1%} of total importance")
+    
+    if thermal_importance > precip_importance:
+        print(f"  → THERMAL DOMINANCE confirmed (hypothesis supported)")
+    else:
+        print(f"  → PRECIPITATION DOMINANCE detected (hypothesis challenged)")
+    
+    print(f"\nIndividual Feature Analysis:")
+    for feature in X_train.columns:
+        coef = feature_importance[feature]
+        norm_imp = normalized_importance[feature]
+        
+        # Interpret physical meaning
+        if feature == 'daily_positive_temp':
+            interpretation = "MORE thermal energy → LOWER albedo (melting)" if coef < 0 else "MORE thermal energy → HIGHER albedo (unexpected)"
+            primary_marker = " ← PRIMARY THERMAL DRIVER"
+        elif feature == 'pdd':
+            interpretation = "MORE cumulative heat → LOWER albedo (melting)" if coef < 0 else "MORE cumulative heat → HIGHER albedo (unexpected)"
+            primary_marker = " ← Thermal history"
+        elif feature == 'snowfall_probability':
+            interpretation = "MORE snowfall → HIGHER albedo (fresh snow)" if coef > 0 else "MORE snowfall → LOWER albedo (unexpected)"
+            primary_marker = " ← Precipitation comparison"
+        else:
+            interpretation = "Later in season → LOWER albedo" if coef < 0 else "Later in season → HIGHER albedo"
+            primary_marker = " ← Seasonal patterns"
+        
+        print(f"  {feature}{primary_marker}:")
+        print(f"    Coefficient: {coef:+.3f}")
+        print(f"    Importance: {norm_imp:.3f} ({norm_imp*100:.1f}%)")
+        print(f"    Physical meaning: {interpretation}")
+    
+    return model, y_pred, r2, rmse, station_metrics, feature_importance, normalized_importance
+
+
+def plot_predicted_vs_measured(y_test, y_pred, test_data):
+    """
+    Create diagnostic scatter plot for temperature-dominated albedo predictions.
+    
+    This visualization specifically highlights thermal model performance:
+    - Station-wise color coding for spatial analysis
+    - Perfect prediction reference for bias assessment
+    - R² annotation for quick performance evaluation
+    - Enhanced formatting for publication quality
+    
+    Diagnostic Interpretation:
+    - Points near 1:1 line: Good thermal prediction
+    - Systematic deviations: Model bias or non-linear effects
+    - Station clustering: Site-specific thermal responses
+    - Scatter magnitude: Prediction uncertainty
+    
+    Parameters:
+    -----------
+    y_test : pd.Series or array-like
+        Observed albedo values (ground truth)
+    y_pred : array-like
+        Temperature-model predicted albedo values
+    test_data : pd.DataFrame
+        Original dataset with station identifiers
+    """
+    plt.figure(figsize=(12, 8))
+    
+    # Define professional color palette for stations
+    colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D', '#6A994E']
+    markers = ['o', 's', '^', 'D', 'v']
+    
+    # Plot by station with enhanced styling
+    for i, station in enumerate(test_data['station'].unique()):
+        station_mask = test_data['station'] == station
+        color = colors[i % len(colors)]
+        marker = markers[i % len(markers)]
+        
+        plt.scatter(y_test[station_mask], y_pred[station_mask], 
+                   alpha=0.7, s=60, color=color, marker=marker,
+                   label=f'{station.upper()}', 
+                   edgecolors='white', linewidth=1)
+    
+    # Add perfect prediction reference line
+    min_val = min(min(y_test), min(y_pred))
+    max_val = max(max(y_test), max(y_pred))
+    line_range = np.linspace(min_val, max_val, 100)
+    plt.plot(line_range, line_range, 'k--', alpha=0.8, linewidth=2.5, 
+             label='Perfect Prediction (1:1)', zorder=1)
+    
+    # Calculate and display performance metrics
+    r2_overall = r2_score(y_test, y_pred)
+    rmse_overall = np.sqrt(mean_squared_error(y_test, y_pred))
+    
+    # Add performance annotation
+    textstr = f'Temperature-Dominated Model\nR² = {r2_overall:.3f}\nRMSE = {rmse_overall:.3f}'
+    props = dict(boxstyle='round,pad=0.5', facecolor='lightblue', alpha=0.8)
+    plt.text(0.05, 0.95, textstr, transform=plt.gca().transAxes, 
+             fontsize=12, fontweight='bold', verticalalignment='top', bbox=props)
+    
+    # Enhanced formatting
+    plt.xlabel('Measured Albedo', fontweight='bold', fontsize=14)
+    plt.ylabel('Predicted Albedo\n(Temperature-Dominated Model)', fontweight='bold', fontsize=14)
+    plt.title('Albedo Prediction Validation: Temperature-Dominated Approach\n'
+              'Daily Positive Temperature as Primary Driver (2011 Test Data)', 
+              fontweight='bold', fontsize=16)
+    
+    plt.legend(loc='lower right', framealpha=0.9, fontsize=11)
+    plt.grid(True, alpha=0.3)
+    
+    # Set equal aspect ratio and limits
+    plt.axis('equal')
+    margin = (max_val - min_val) * 0.05
+    plt.xlim(min_val - margin, max_val + margin)
+    plt.ylim(min_val - margin, max_val + margin)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_feature_importance(feature_importance):
+    """
+    Visualize thermal vs. precipitation feature importance.
+    
+    This plot emphasizes the relative importance of thermal processes
+    (daily_positive_temp, pdd) versus precipitation processes (snowfall_probability)
+    in controlling glacier albedo dynamics.
+    
+    Visual Design:
+    - Color coding by process type (thermal vs precipitation)
+    - Coefficient magnitude and direction
+    - Enhanced annotations for thermal interpretation
+    
+    Parameters:
+    -----------
+    feature_importance : dict
+        Regression coefficients mapped to feature names
+    """
+    plt.figure(figsize=(12, 7))
+    
+    # Prepare data for plotting
+    importance_df = pd.DataFrame({
+        'Feature': list(feature_importance.keys()),
+        'Coefficient': list(feature_importance.values())
+    })
+    
+    # Sort by absolute coefficient value
+    importance_df = importance_df.sort_values('Coefficient', key=abs, ascending=True)
+    
+    # Define process-based color scheme
+    colors = []
+    process_labels = []
+    for feature in importance_df['Feature']:
+        if feature in ['daily_positive_temp', 'pdd']:
+            colors.append('#FF6B35')  # Orange-red for thermal
+            process_labels.append('Thermal')
+        elif feature == 'snowfall_probability':
+            colors.append('#004E89')  # Blue for precipitation
+            process_labels.append('Precipitation')
+        else:
+            colors.append('#7209B7')  # Purple for seasonal
+            process_labels.append('Seasonal')
+    
+    # Create horizontal bar plot
+    bars = plt.barh(importance_df['Feature'], importance_df['Coefficient'], 
+                   color=colors, alpha=0.8, edgecolor='white', linewidth=1)
+    
+    # Add coefficient values as annotations
+    for i, (feature, coef) in enumerate(zip(importance_df['Feature'], importance_df['Coefficient'])):
+        # Position text based on coefficient sign
+        text_x = coef + (0.002 if coef >= 0 else -0.002)
+        ha = 'left' if coef >= 0 else 'right'
+        
+        plt.text(text_x, i, f'{coef:+.3f}', 
+                ha=ha, va='center', fontweight='bold', fontsize=11)
+    
+    # Enhanced formatting
+    plt.xlabel('Regression Coefficient', fontweight='bold', fontsize=14)
+    plt.ylabel('Features', fontweight='bold', fontsize=14)
+    plt.title('Temperature-Dominated Model: Feature Importance\n'
+              'Thermal vs. Precipitation Process Contributions', 
+              fontweight='bold', fontsize=16)
+    
+    plt.grid(True, alpha=0.3, axis='x')
+    plt.axvline(x=0, color='black', linestyle='-', alpha=0.7, linewidth=1)
+    
+    # Create custom legend for process types
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#FF6B35', alpha=0.8, label='Thermal Processes'),
+        Patch(facecolor='#004E89', alpha=0.8, label='Precipitation Processes'),
+        Patch(facecolor='#7209B7', alpha=0.8, label='Seasonal Patterns')
+    ]
+    plt.legend(handles=legend_elements, loc='lower right', fontsize=11)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_station_time_series(station_name, test_data, y_test, y_pred):
+    """
+    Create detailed temporal validation plot for temperature-dominated predictions.
+    
+    This time series view shows how well thermal variables capture albedo
+    evolution throughout the ablation season at individual glacier sites.
+    
+    Key Features:
+    - Measured vs. predicted albedo time series
+    - Prediction error shading
+    - Station-specific performance metrics
+    - Monthly temporal reference
+    - Thermal model interpretation
+    
+    Parameters:
+    -----------
+    station_name : str
+        Station identifier for focused analysis
+    test_data : pd.DataFrame
+        Original temporal dataset
+    y_test : pd.Series
+        Observed albedo values
+    y_pred : array-like
+        Temperature-model predictions
+    """
+    # Extract and validate station data
+    station_mask = test_data['station'] == station_name
+    
+    if not station_mask.any():
+        print(f"Warning: No thermal data found for station {station_name}")
+        return
+    
+    station_data = test_data[station_mask].copy()
+    station_measured = y_test[station_mask]
+    station_predicted = y_pred[station_mask]
+    
+    # Sort by temporal order
+    sort_indices = np.argsort(station_data['day_of_year'].values)
+    days_sorted = station_data['day_of_year'].values[sort_indices]
+    measured_sorted = station_measured.values[sort_indices]
+    predicted_sorted = station_predicted[sort_indices]
+    
+    # Calculate thermal model performance
+    station_r2 = r2_score(station_measured, station_predicted)
+    station_rmse = np.sqrt(mean_squared_error(station_measured, station_predicted))
+    station_mae = np.mean(np.abs(station_measured - station_predicted))
+    
+    # Create enhanced time series plot
+    plt.figure(figsize=(15, 9))
+    
+    # Plot measured albedo with enhanced styling
+    plt.plot(days_sorted, measured_sorted, 'b-', linewidth=3, 
+             label='Measured Albedo', alpha=0.9, marker='o', markersize=5,
+             markerfacecolor='white', markeredgecolor='blue', markeredgewidth=1.5)
+    
+    # Plot temperature-model predictions
+    plt.plot(days_sorted, predicted_sorted, 'r--', linewidth=2.5, 
+             label='Temperature-Model Prediction', alpha=0.9, marker='s', markersize=4,
+             markerfacecolor='red', markeredgecolor='darkred', markeredgewidth=1)
+    
+    # Add prediction error visualization
+    plt.fill_between(days_sorted, measured_sorted, predicted_sorted, 
+                     alpha=0.25, color='gray', label='Prediction Error Zone')
+    
+    # Performance metrics annotation
+    textstr = (f'Temperature-Dominated Model Performance\n'
+               f'R² = {station_r2:.3f}\n'
+               f'RMSE = {station_rmse:.3f}\n'
+               f'MAE = {station_mae:.3f}\n'
+               f'Samples = {len(station_measured)}')
+    props = dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.9, edgecolor='orange')
+    plt.text(0.02, 0.98, textstr, transform=plt.gca().transAxes, fontsize=12,
+             verticalalignment='top', bbox=props, fontweight='bold')
+    
+    # Enhanced formatting
+    plt.xlabel('Day of Year', fontweight='bold', fontsize=14)
+    plt.ylabel('Surface Albedo', fontweight='bold', fontsize=14)
+    plt.title(f'Temperature-Dominated Albedo Prediction: {station_name.upper()} Station\n'
+              f'Daily Positive Temperature Model Validation (2011 Extended Season)', 
+              fontweight='bold', fontsize=16)
+    
+    plt.legend(loc='upper right', framealpha=0.9, fontsize=12)
+    plt.grid(True, alpha=0.3)
+    
+    # Set appropriate y-axis limits
+    plt.ylim(0, 1)
+    
+    # Add monthly reference markers
+    month_days = [98, 121, 152, 182, 213, 244]  # Mid-month approximations
+    month_labels = ['Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep']
+    
+    # Filter to data range
+    data_range = (min(days_sorted), max(days_sorted))
+    valid_months = [(day, label) for day, label in zip(month_days, month_labels) 
+                   if data_range[0] <= day <= data_range[1]]
+    
+    if valid_months:
+        valid_days, valid_labels = zip(*valid_months)
+        plt.xticks(valid_days, valid_labels)
+        
+        # Add subtle month separators
+        for day in valid_days:
+            plt.axvline(x=day, color='gray', linestyle=':', alpha=0.5)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def main():
+    """
+    Main execution function for temperature-dominated albedo prediction analysis.
+    
+    This comprehensive workflow implements and validates the hypothesis that
+    daily positive temperature is a superior predictor of glacier albedo compared
+    to snowfall probability. The analysis provides quantitative comparison between
+    thermal and precipitation controls on Arctic glacier surface properties.
+    
+    Research Questions Addressed:
+    1. How well does daily positive temperature predict albedo changes?
+    2. What is the relative importance of thermal vs. precipitation processes?
+    3. Does the thermal model generalize across different glacier sites?
+    4. How does thermal model performance compare to snowfall-dominated approach?
+    
+    Methodology:
+    - Linear regression with thermal-focused features
+    - Temporal cross-validation (different years for train/test)
+    - Spatial validation across multiple glacier sites
+    - Extended ablation season analysis (April 8 - September 4)
+    
+    Expected Outcomes:
+    - If thermal dominance hypothesis is correct: high R², negative temp coefficients
+    - If precipitation dominance persists: snowfall_probability remains most important
+    - Spatial consistency indicates robust thermal relationships
+    """
+    print("="*70)
+    print("SVALBARD GLACIER ALBEDO PREDICTION: TEMPERATURE-DOMINATED MODEL")
+    print("Thermal Process Emphasis vs. Precipitation Controls")
+    print("="*70)
+    print(f"Analysis initiated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # ==============================================
+    # Research Hypothesis and Dataset Configuration
+    # ==============================================
+    
+    print(f"\nRESEARCH HYPOTHESIS:")
+    print(f"  Daily positive temperature is a superior predictor of glacier")
+    print(f"  albedo compared to snowfall probability, representing the")
+    print(f"  dominance of thermal processes over precipitation processes")
+    print(f"  in controlling Arctic glacier surface reflectance.")
+    
+    # Training datasets: Multi-year thermal calibration
+    # Excludes 2011 to ensure independent temporal validation
+    train_files = [
+        "hans4_2010_processed_with_pdd.csv",      # Hansbreen lower - thermal baseline
+        "hans9_2010_processed_with_pdd.csv",      # Hansbreen upper - elevation gradient
+        "werenskiold_2012_processed_with_pdd.csv", # Werenskiöldbreen - spatial validation
+        # 2011 files reserved for independent testing:
+        #"hans4_2011_processed_with_pdd.csv",
+        #"hans9_2011_processed_with_pdd.csv", 
+        #"werenskiold_2011_processed_with_pdd.csv"
+    ]
+    
+    # Testing datasets: Independent year for robust validation
+    test_files = [
+        "hans4_2011_processed_with_pdd.csv",      # Hansbreen 2011 validation
+        #"hans9_2011_processed_with_pdd.csv",     # Currently excluded (data quality?)
+        "werenskiold_2011_processed_with_pdd.csv" # Werenskiöldbreen 2011 validation
+    ]
+    
+    print(f"\nDATASET CONFIGURATION:")
+    print(f"  Training Strategy: Multi-year thermal calibration")
+    print(f"  Testing Strategy: Independent year validation (2011)")
+    print(f"  Spatial Coverage: Two glacier systems (Hansbreen, Werenskiöldbreen)")
+    
+    print(f"\n  Training Files ({len(train_files)}):")
+    for f in train_files:
+        year = f.split('_')[1]
+        station = f.split('_')[0]
+        print(f"    - {f} ({station.upper()} {year})")
+    
+    print(f"\n  Testing Files ({len(test_files)}):")
+    for f in test_files:
+        year = f.split('_')[1] 
+        station = f.split('_')[0]
+        print(f"    - {f} ({station.upper()} {year})")
+    
+    # ==============================================
+    # Thermal Data Preparation Pipeline
+    # ==============================================
+    
+    print(f"\n{'-'*50}")
+    print("THERMAL DATA PREPARATION PIPELINE")
+    print(f"{'-'*50}")
+    
+    # Load and prepare thermal-focused datasets
+    X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_data_clean = prepare_data(
+        train_files, test_files
+    )
+    
+    # Validate thermal data availability
+    if len(X_train_clean) == 0:
+        print("ERROR: No training data loaded. Check file paths and thermal variables.")
+        return
+    if len(X_test_clean) == 0:
+        print("ERROR: No testing data loaded. Check file paths and thermal variables.")
+        return
+    
+    # Verify thermal feature availability
+    thermal_features = ['daily_positive_temp', 'pdd']
+    missing_thermal = [f for f in thermal_features if f not in X_train_clean.columns]
+    if missing_thermal:
+        print(f"WARNING: Missing thermal features: {missing_thermal}")
+        print("Model may not properly test thermal dominance hypothesis.")
+    
+    # ==============================================
+    # Temperature-Dominated Model Training
+    # ==============================================
+    
+    print(f"\n{'-'*50}")
+    print("THERMAL MODEL TRAINING AND VALIDATION")
+    print(f"{'-'*50}")
+    
+    # Train thermal model and conduct comprehensive evaluation
+    model, y_pred, r2, rmse, station_metrics, feature_importance, normalized_importance = train_and_evaluate_model(
+        X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_data_clean
+    )
+    
+    # ==============================================
+    # Thermal Dominance Hypothesis Testing
+    # ==============================================
+    
+    print(f"\n{'-'*50}")
+    print("THERMAL DOMINANCE HYPOTHESIS EVALUATION")
+    print(f"{'-'*50}")
+    
+    # Test primary hypothesis: thermal vs precipitation dominance
+    thermal_features = ['daily_positive_temp', 'pdd']
+    thermal_importance = sum(normalized_importance.get(f, 0) for f in thermal_features)
+    precip_importance = normalized_importance.get('snowfall_probability', 0)
+    seasonal_importance = normalized_importance.get('day_of_year', 0)
+    
+    print(f"Process Contribution Analysis:")
+    print(f"  Thermal Processes: {thermal_importance:.1%}")
+    print(f"    - Daily positive temp: {normalized_importance.get('daily_positive_temp', 0):.1%}")
+    print(f"    - Cumulative PDD: {normalized_importance.get('pdd', 0):.1%}")
+    print(f"  Precipitation Processes: {precip_importance:.1%}")
+    print(f"  Seasonal Patterns: {seasonal_importance:.1%}")
+    
+    # Hypothesis test results
+    print(f"\nHYPOTHESIS TEST RESULTS:")
+    if thermal_importance > precip_importance:
+        dominance_ratio = thermal_importance / precip_importance if precip_importance > 0 else float('inf')
+        print(f"  ✓ THERMAL DOMINANCE CONFIRMED")
+        print(f"    Thermal processes are {dominance_ratio:.1f}x more important than precipitation")
+        print(f"    → Daily positive temperature successfully predicts albedo changes")
+        print(f"    → Supports thermal control hypothesis")
+    else:
+        dominance_ratio = precip_importance / thermal_importance if thermal_importance > 0 else float('inf')
+        print(f"  ✗ PRECIPITATION DOMINANCE PERSISTS")
+        print(f"    Precipitation processes are {dominance_ratio:.1f}x more important than thermal")
+        print(f"    → Snowfall probability remains superior predictor")
+        print(f"    → Challenges thermal control hypothesis")
+    
+    # Model performance assessment
+    print(f"\nMODEL PERFORMANCE ASSESSMENT:")
+    if r2 >= 0.7:
+        performance = "EXCELLENT"
+    elif r2 >= 0.5:
+        performance = "GOOD"
+    elif r2 >= 0.3:
+        performance = "MODERATE"
+    else:
+        performance = "POOR"
+    
+    print(f"  Overall Performance: {performance} (R² = {r2:.3f})")
+    print(f"  Prediction Accuracy: RMSE = {rmse:.3f}")
+    
+    # Spatial consistency evaluation
+    if len(station_metrics) > 1:
+        station_r2_values = [metrics['R2'] for metrics in station_metrics.values()]
+        r2_std = np.std(station_r2_values)
+        r2_mean = np.mean(station_r2_values)
+        
+        print(f"\nSPATIAL GENERALIZATION:")
+        print(f"  Cross-station R² mean: {r2_mean:.3f}")
+        print(f"  Cross-station R² std: {r2_std:.3f}")
+        
+        if r2_std < 0.1:
+            print(f"  → EXCELLENT spatial consistency")
+            print(f"  → Thermal relationships are robust across glacier sites")
+        elif r2_std < 0.2:
+            print(f"  → GOOD spatial consistency")
+            print(f"  → Thermal model generalizes well")
+        else:
+            print(f"  → VARIABLE spatial performance")
+            print(f"  → Site-specific thermal responses detected")
+    
+    # ==============================================
+    # Comprehensive Results Summary
+    # ==============================================
+    
+    print(f"\n{'='*70}")
+    print("TEMPERATURE-DOMINATED MODEL: FINAL RESULTS")
+    print(f"{'='*70}")
+    
+    print(f"Model Configuration:")
+    print(f"  Type: Linear Regression with Thermal Emphasis")
+    print(f"  Primary Feature: Daily Positive Temperature")
+    print(f"  Season: Extended Ablation Period (April 8 - September 4)")
+    print(f"  Training: 2010, 2012 (Multi-year calibration)")
+    print(f"  Testing: 2011 (Independent validation)")
+    
+    print(f"\nOverall Performance:")
+    print(f"  R² Score: {r2:.3f}")
+    print(f"  RMSE: {rmse:.3f}")
+    print(f"  Performance Grade: {performance}")
+    
+    print(f"\nStation-Specific Results:")
+    for station, metrics in station_metrics.items():
+        print(f"  {station.upper()}:")
+        print(f"    R² = {metrics['R2']:.3f}")
+        print(f"    RMSE = {metrics['RMSE']:.3f}")
+        print(f"    Samples = {metrics['n_samples']}")
+    
+    print(f"\nThermal Feature Analysis:")
+    for feature in ['daily_positive_temp', 'pdd']:
+        if feature in feature_importance:
+            coef = feature_importance[feature]
+            importance = normalized_importance[feature]
+            
+            # Physical interpretation
+            if feature == 'daily_positive_temp':
+                process = "Daily thermal energy input"
+                expected = "negative (more heat → lower albedo via melting)"
+            else:
+                process = "Cumulative thermal history"
+                expected = "negative (more cumulative heat → lower albedo)"
+            
+            actual_sign = "negative" if coef < 0 else "positive"
+            match_expectation = "✓ as expected" if (coef < 0) else "⚠ unexpected"
+            
+            print(f"  {feature}:")
+            print(f"    Process: {process}")
+            print(f"    Coefficient: {coef:+.3f} ({actual_sign}) {match_expectation}")
+            print(f"    Importance: {importance:.1%}")
+    
+    # ==============================================
+    # Visualization Generation
+    # ==============================================
+    
+    print(f"\n{'-'*50}")
+    print("GENERATING THERMAL MODEL VISUALIZATIONS")
+    print(f"{'-'*50}")
+    
+    # Main diagnostic plots
+    print("1. Creating predicted vs. measured scatter plot...")
+    plot_predicted_vs_measured(y_test_clean, y_pred, test_data_clean)
+    
+    print("2. Creating thermal feature importance plot...")
+    plot_feature_importance(feature_importance)
+    
+    # Station-specific temporal analysis
+    print("3. Creating station-specific time series validations...")
+    for station in test_data_clean['station'].unique():
+        print(f"   → Plotting thermal model validation for {station.upper()}...")
+        plot_station_time_series(station, test_data_clean, y_test_clean, y_pred)
+    
+    # ==============================================
+    # Research Recommendations and Next Steps
+    # ==============================================
+    
+    print(f"\n{'-'*50}")
+    print("RESEARCH RECOMMENDATIONS")
+    print(f"{'-'*50}")
+    
+    print(f"\nModel Validation Status:")
+    if r2 > 0.6 and thermal_importance > 0.4:
+        print(f"  ✓ STRONG validation of thermal control hypothesis")
+        print(f"  → Daily positive temperature is excellent albedo predictor")
+        print(f"  → Recommended for operational albedo modeling")
+    elif r2 > 0.4 and thermal_importance > 0.3:
+        print(f"  ✓ MODERATE validation of thermal control hypothesis")
+        print(f"  → Daily positive temperature shows predictive value")
+        print(f"  → Consider hybrid thermal-precipitation models")
+    else:
+        print(f"  ⚠ LIMITED validation of thermal control hypothesis")
+        print(f"  → Snowfall probability may remain superior approach")
+        print(f"  → Investigate non-linear thermal relationships")
+    
+    print(f"\nComparative Analysis Recommendations:")
+    print(f"  1. Direct comparison with snowfall-dominated model performance")
+    print(f"  2. Hybrid model combining thermal and precipitation features")
+    print(f"  3. Non-linear models (Random Forest, Neural Networks) for thermal processes")
+    print(f"  4. Extended validation with additional years (2013-2015)")
+    print(f"  5. Seasonal sub-analysis (early vs. late ablation periods)")
+    
+    print(f"\nPublication Considerations:")
+    print(f"  • Emphasize process-based model comparison approach")
+    print(f"  • Highlight spatial generalization across glacier sites")
+    print(f"  • Discuss thermal vs. precipitation process dominance")
+    print(f"  • Consider Arctic glacier management applications")
+    print(f"  • Address implications for climate change impact modeling")
+    
+    print(f"\nNext Research Directions:")
+    print(f"  • Energy balance modeling integration")
+    print(f"  • Sub-daily thermal cycle analysis")
+    print(f"  • Multi-glacier validation across Svalbard")
+    print(f"  • Long-term thermal trend analysis")
+    print(f"  • Integration with satellite albedo products")
+    
+    print(f"\n{'='*70}")
+    print(f"Temperature-dominated analysis completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*70}")
+
+
+# ==============================================
+# Script Execution Entry Point
+# ==============================================
+
+if __name__ == "__main__":
+    """
+    Execute the temperature-dominated albedo prediction analysis.
+    
+    This script provides a complete alternative to the snowfall-dominated approach,
+    allowing direct comparison of thermal vs. precipitation controls on glacier
+    albedo. The analysis is designed for scientific publication and provides
+    comprehensive validation of the thermal dominance hypothesis.
+    
+    Usage:
+    1. Direct execution: python thermal_albedo_model.py
+    2. Module import: from thermal_albedo_model import main, train_and_evaluate_model
+    3. Integration: Use individual functions in larger analysis pipelines
+    
+    Output:
+    - Comprehensive performance metrics and statistical validation
+    - Publication-ready visualizations and diagnostic plots
+    - Detailed thermal process interpretation and recommendations
+    - Comparative framework for model selection and hybrid approaches
+    """
+    main()
