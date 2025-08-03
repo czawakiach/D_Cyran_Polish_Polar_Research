@@ -1,0 +1,862 @@
+"""
+Linear Regression Model for Albedo Prediction on Svalbard Glaciers
+================================================================
+
+This script implements a machine learning approach to predict glacier surface albedo
+using meteorological and snowfall probability data. The model validates the snowfall
+probability calculations by testing their predictive power for observed albedo changes,
+which serve as a proxy for actual snowfall accumulation events.
+
+Scientific Background:
+- Surface albedo is a key indicator of snowfall events on glaciers
+- Fresh snow dramatically increases surface reflectance (albedo ~0.8-0.9)
+- Bare ice or aged snow has much lower albedo (~0.3-0.5)
+- This relationship allows albedo to serve as ground truth for snowfall validation
+
+Model Architecture:
+- Linear regression with meteorological features
+- Training: 2010 data (hans4, hans9) + 2012 (werenskiold)
+- Testing: 2011 data (independent year for validation)
+- Season: April 8 - September 4 (ablation season)
+
+Features:
+- day_of_year: Seasonal cycle effects
+- TC: Air temperature (°C)
+- pdd: Positive degree days (cumulative melting potential)
+- snowfall_probability: Calculated probability from companion script
+
+Author: Dominik Cyran
+Institution: University of Silesia in Katowice
+Date: 03/08/2025
+Version: 1.0
+
+Dependencies:
+- pandas, numpy, scikit-learn
+- matplotlib, seaborn
+- pathlib, datetime
+
+Related Scripts:
+- Snowfall probability calculation script (generates snowfall_probability feature)
+
+Publication: [Your Publication Title/DOI when available]
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.impute import SimpleImputer
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+
+
+def load_and_combine_data(train_files, test_files):
+    """
+    Load and combine meteorological datasets for training and testing.
+    
+    This function separately loads training and testing datasets to ensure
+    proper temporal separation. The training data comes from different years
+    than the testing data to validate model generalization across years.
+    
+    Expected file format:
+    CSV files with columns: date, day_of_year, TC, pdd, snowfall_probability, 
+    albedo, station, year
+    
+    Parameters:
+    -----------
+    train_files : list of str
+        List of file paths for training data
+        (2010 hans4/hans9, 2012 werenskiold)
+    test_files : list of str
+        List of file paths for testing data
+        (2011 data for all available stations)
+    
+    Returns:
+    --------
+    tuple of pd.DataFrame
+        (train_df, test_df) - Combined training and testing datasets
+    """
+    # Load and concatenate training datasets
+    train_dfs = []
+    for file_path in train_files:
+        try:
+            df = pd.read_csv(file_path)
+            print(f"Loaded training file: {file_path} ({len(df)} records)")
+            train_dfs.append(df)
+        except FileNotFoundError:
+            print(f"Warning: Training file not found: {file_path}")
+        except Exception as e:
+            print(f"Error loading training file {file_path}: {e}")
+    
+    # Load and concatenate testing datasets
+    test_dfs = []
+    for file_path in test_files:
+        try:
+            df = pd.read_csv(file_path)
+            print(f"Loaded testing file: {file_path} ({len(df)} records)")
+            test_dfs.append(df)
+        except FileNotFoundError:
+            print(f"Warning: Testing file not found: {file_path}")
+        except Exception as e:
+            print(f"Error loading testing file {file_path}: {e}")
+    
+    # Combine datasets
+    train_combined = pd.concat(train_dfs, ignore_index=True) if train_dfs else pd.DataFrame()
+    test_combined = pd.concat(test_dfs, ignore_index=True) if test_dfs else pd.DataFrame()
+    
+    print(f"\nCombined training data: {len(train_combined)} records")
+    print(f"Combined testing data: {len(test_combined)} records")
+    
+    return train_combined, test_combined
+
+
+def filter_season(df, year_col='year', doy_col='day_of_year'):
+    """
+    Filter dataset to focus on the extended ablation season.
+    
+    The extended season (April 8 - September 4) captures the primary
+    snowfall-albedo dynamics while excluding winter months with
+    persistent snow cover and limited solar radiation.
+    
+    Seasonal considerations:
+    - April 8 (DOY 98): Onset of significant solar radiation
+    - September 4 (DOY 247): End of primary ablation season
+    - This period maximizes snowfall event detection via albedo changes
+    - Excludes polar night and continuous snow cover periods
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input dataset with day_of_year column
+    year_col : str, default 'year'
+        Column name for year information (for reference)
+    doy_col : str, default 'day_of_year'
+        Column name for day of year (1-365/366)
+    
+    Returns:
+    --------
+    pd.DataFrame
+        Filtered dataset containing only extended season data
+    """
+    # Define seasonal boundaries (day of year)
+    spring_start_doy = 98   # April 8th - onset of significant melting
+    end_date_doy = 247      # September 4th - end of primary ablation season
+    
+    # Apply seasonal filter
+    season_mask = (df[doy_col] >= spring_start_doy) & (df[doy_col] <= end_date_doy)
+    filtered_df = df[season_mask].copy()
+    
+    print(f"Seasonal filtering: {len(df)} → {len(filtered_df)} records")
+    print(f"Season: Day {spring_start_doy} (Apr 8) to Day {end_date_doy} (Sep 4)")
+    
+    return filtered_df
+
+
+def prepare_data(train_files, test_files):
+    """
+    Comprehensive data preparation pipeline for albedo prediction model.
+    
+    This function handles the complete data preparation workflow:
+    1. Load training and testing datasets
+    2. Apply seasonal filtering
+    3. Define feature set for regression
+    4. Handle missing values with appropriate imputation
+    5. Prepare clean datasets for model training
+    
+    Training Strategy:
+    - Temporal separation: Different years for training vs. testing
+    - Spatial generalization: Multiple stations in training set
+    - Feature imputation: Mean-based strategy for missing values
+    
+    Parameters:
+    -----------
+    train_files : list of str
+        Training data file paths (2010, 2012 data)
+    test_files : list of str
+        Testing data file paths (2011 data)
+    
+    Returns:
+    --------
+    tuple
+        X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_df
+        - Cleaned feature matrices and target vectors
+        - Original test dataframe for analysis
+    """
+    # Load datasets with proper train/test separation
+    train_df, test_df = load_and_combine_data(train_files, test_files)
+    
+    # Apply seasonal filtering to focus on ablation period
+    train_df = filter_season(train_df)
+    test_df = filter_season(test_df)
+    
+    # Define feature set for albedo prediction
+    # These features capture different aspects of snowfall and melting processes:
+    feature_cols = [
+        'day_of_year',          # Seasonal cycle (solar radiation, temperature patterns)
+        'TC',                   # Instantaneous air temperature (°C)
+        'pdd',                  # Positive degree days (cumulative melting potential)
+        'snowfall_probability'  # Calculated snowfall likelihood (main predictor)
+    ]
+    
+    print(f"\nFeature set: {feature_cols}")
+    
+    # Extract features and targets
+    X_train = train_df[feature_cols]
+    y_train = train_df['albedo']  # Target: surface albedo (0-1 scale)
+    
+    X_test = test_df[feature_cols]
+    y_test = test_df['albedo']
+    
+    # Handle missing values in feature matrix
+    # Mean imputation preserves feature distributions while handling gaps
+    feature_imputer = SimpleImputer(strategy='mean')
+    
+    # Fit imputer on training data and transform both sets
+    X_train_clean = pd.DataFrame(
+        feature_imputer.fit_transform(X_train),
+        columns=X_train.columns,
+        index=X_train.index
+    )
+    X_test_clean = pd.DataFrame(
+        feature_imputer.transform(X_test),
+        columns=X_test.columns,
+        index=X_test.index
+    )
+    
+    # Handle missing values in target variable (albedo)
+    target_imputer = SimpleImputer(strategy='mean')
+    y_train_clean = pd.Series(
+        target_imputer.fit_transform(y_train.values.reshape(-1, 1)).ravel(),
+        index=y_train.index
+    )
+    y_test_clean = pd.Series(
+        target_imputer.transform(y_test.values.reshape(-1, 1)).ravel(),
+        index=y_test.index
+    )
+    
+    # Report data quality information
+    print("\n" + "="*50)
+    print("DATA QUALITY SUMMARY")
+    print("="*50)
+    print("\nMissing values before imputation:")
+    print("\nTraining features:")
+    missing_train = X_train.isna().sum()
+    for col, missing in missing_train.items():
+        if missing > 0:
+            print(f"  {col}: {missing} missing ({missing/len(X_train)*100:.1f}%)")
+    
+    print(f"\nTraining target (albedo): {y_train.isna().sum()} missing")
+    print(f"Testing target (albedo): {y_test.isna().sum()} missing")
+    
+    print(f"\nFinal dataset sizes:")
+    print(f"  Training: {len(X_train_clean)} samples")
+    print(f"  Testing: {len(X_test_clean)} samples")
+    
+    return X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_df
+
+
+def train_and_evaluate_model(X_train, X_test, y_train, y_test, test_data):
+    """
+    Train linear regression model and conduct comprehensive evaluation.
+    
+    This function implements the core machine learning pipeline:
+    1. Train linear regression model on multi-year training data
+    2. Generate predictions on independent test year
+    3. Calculate overall and station-specific performance metrics
+    4. Analyze feature importance and coefficients
+    
+    Model Evaluation Strategy:
+    - Overall metrics: R² and RMSE across all test data
+    - Station-specific metrics: Performance at individual glacier sites
+    - Feature importance: Relative contribution of each predictor
+    
+    Linear Regression Advantages:
+    - Interpretable coefficients
+    - No hyperparameter tuning required
+    - Robust baseline for albedo prediction
+    - Direct assessment of snowfall probability importance
+    
+    Parameters:
+    -----------
+    X_train : pd.DataFrame
+        Training feature matrix
+    X_test : pd.DataFrame
+        Testing feature matrix  
+    y_train : pd.Series
+        Training target values (albedo)
+    y_test : pd.Series
+        Testing target values (albedo)
+    test_data : pd.DataFrame
+        Original test dataset for station-specific analysis
+    
+    Returns:
+    --------
+    tuple
+        model, y_pred, r2, rmse, station_metrics, feature_importance, normalized_importance
+        - Trained model object
+        - Predictions on test set
+        - Overall performance metrics
+        - Station-specific performance breakdown
+        - Feature importance analysis
+    """
+    print("\n" + "="*50)
+    print("MODEL TRAINING AND EVALUATION")
+    print("="*50)
+    
+    # Initialize and train linear regression model
+    model = LinearRegression()
+    print("Training linear regression model...")
+    model.fit(X_train, y_train)
+    
+    # Generate predictions on test set
+    y_pred = model.predict(X_test)
+    print("Generating predictions on test data...")
+    
+    # Calculate overall performance metrics
+    r2 = r2_score(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    mae = np.mean(np.abs(y_test - y_pred))  # Mean Absolute Error
+    
+    print(f"\nOverall Model Performance:")
+    print(f"  R² Score: {r2:.3f}")
+    print(f"  RMSE: {rmse:.3f}")
+    print(f"  MAE: {mae:.3f}")
+    
+    # Calculate station-specific performance metrics
+    station_metrics = {}
+    print(f"\nStation-Specific Performance:")
+    
+    for station in test_data['station'].unique():
+        # Create station mask
+        station_mask = test_data['station'] == station
+        station_y_test = y_test[station_mask]
+        station_y_pred = y_pred[station_mask]
+        
+        # Calculate metrics for this station
+        if len(station_y_test) > 1:  # Need at least 2 points for R²
+            station_r2 = r2_score(station_y_test, station_y_pred)
+            station_rmse = np.sqrt(mean_squared_error(station_y_test, station_y_pred))
+            station_mae = np.mean(np.abs(station_y_test - station_y_pred))
+            
+            station_metrics[station] = {
+                'R2': station_r2,
+                'RMSE': station_rmse,
+                'MAE': station_mae,
+                'n_samples': len(station_y_test)
+            }
+            
+            print(f"  {station}:")
+            print(f"    R² Score: {station_r2:.3f}")
+            print(f"    RMSE: {station_rmse:.3f}")
+            print(f"    MAE: {station_mae:.3f}")
+            print(f"    Samples: {len(station_y_test)}")
+        else:
+            print(f"  {station}: Insufficient data for evaluation")
+    
+    # Analyze feature importance (regression coefficients)
+    feature_importance = dict(zip(X_train.columns, model.coef_))
+    
+    # Calculate normalized importance (relative contribution)
+    abs_coefficients = np.abs(model.coef_)
+    normalized_importance = abs_coefficients / np.sum(abs_coefficients)
+    normalized_importance = dict(zip(X_train.columns, normalized_importance))
+    
+    print(f"\nFeature Importance Analysis:")
+    print(f"  Model Intercept: {model.intercept_:.3f}")
+    for feature in X_train.columns:
+        coef = feature_importance[feature]
+        norm_imp = normalized_importance[feature]
+        print(f"  {feature}:")
+        print(f"    Coefficient: {coef:.3f}")
+        print(f"    Normalized Importance: {norm_imp:.3f} ({norm_imp*100:.1f}%)")
+    
+    return model, y_pred, r2, rmse, station_metrics, feature_importance, normalized_importance
+
+
+def plot_predicted_vs_measured(y_test, y_pred, test_data):
+    """
+    Create scatter plot comparing predicted vs. measured albedo values.
+    
+    This diagnostic plot helps assess:
+    - Overall model fit quality
+    - Systematic biases or non-linearities
+    - Station-specific performance differences
+    - Outliers or unusual predictions
+    
+    Plot Features:
+    - Color-coded by station for spatial analysis
+    - 1:1 reference line for perfect prediction
+    - R² annotation for quick assessment
+    - Publication-ready formatting
+    
+    Parameters:
+    -----------
+    y_test : pd.Series or array-like
+        True albedo values from test set
+    y_pred : array-like
+        Predicted albedo values from model
+    test_data : pd.DataFrame
+        Original test dataset with station information
+    """
+    plt.figure(figsize=(12, 8))
+    
+    # Define colors for different stations
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    
+    # Plot data points by station
+    for i, station in enumerate(test_data['station'].unique()):
+        station_mask = test_data['station'] == station
+        color = colors[i % len(colors)]
+        
+        plt.scatter(y_test[station_mask], y_pred[station_mask], 
+                   alpha=0.6, s=50, color=color, label=f'{station}', 
+                   edgecolors='white', linewidth=0.5)
+    
+    # Add perfect prediction reference line
+    min_val = min(min(y_test), min(y_pred))
+    max_val = max(max(y_test), max(y_pred))
+    line_range = np.linspace(min_val, max_val, 100)
+    plt.plot(line_range, line_range, 'k--', alpha=0.7, linewidth=2, 
+             label='Perfect Prediction (1:1)')
+    
+    # Calculate and display overall R²
+    r2_overall = r2_score(y_test, y_pred)
+    plt.text(0.05, 0.95, f'Overall R² = {r2_overall:.3f}', 
+             transform=plt.gca().transAxes, fontsize=12, fontweight='bold',
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+    
+    # Formatting
+    plt.xlabel('Measured Albedo', fontweight='bold', fontsize=12)
+    plt.ylabel('Predicted Albedo', fontweight='bold', fontsize=12)
+    plt.title('Albedo Prediction Model Validation\nLinear Regression Performance (2011 Test Data)', 
+              fontweight='bold', fontsize=14)
+    plt.legend(loc='lower right', framealpha=0.9)
+    plt.grid(True, alpha=0.3)
+    
+    # Set equal aspect ratio for proper interpretation
+    plt.axis('equal')
+    plt.xlim(min_val, max_val)
+    plt.ylim(min_val, max_val)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_feature_importance(feature_importance):
+    """
+    Visualize feature importance through regression coefficients.
+    
+    This plot shows the relative importance of each meteorological variable
+    in predicting albedo changes. Coefficient magnitude indicates the strength
+    of the linear relationship, while sign indicates direction.
+    
+    Interpretation:
+    - Positive coefficients: Feature increases → Albedo increases
+    - Negative coefficients: Feature increases → Albedo decreases
+    - Magnitude: Strength of linear relationship
+    
+    Parameters:
+    -----------
+    feature_importance : dict
+        Dictionary mapping feature names to regression coefficients
+    """
+    plt.figure(figsize=(10, 6))
+    
+    # Prepare data for plotting
+    importance_df = pd.DataFrame({
+        'Feature': list(feature_importance.keys()),
+        'Coefficient': list(feature_importance.values())
+    })
+    
+    # Sort by absolute coefficient value for better visualization
+    importance_df = importance_df.sort_values('Coefficient', key=abs, ascending=True)
+    
+    # Create horizontal bar plot
+    bars = plt.barh(importance_df['Feature'], importance_df['Coefficient'])
+    
+    # Color bars based on sign (positive = blue, negative = red)
+    for i, (bar, coef) in enumerate(zip(bars, importance_df['Coefficient'])):
+        if coef >= 0:
+            bar.set_color('#2E86AB')  # Blue for positive
+        else:
+            bar.set_color('#A23B72')  # Red for negative
+    
+    # Add coefficient values as text
+    for i, (feature, coef) in enumerate(zip(importance_df['Feature'], importance_df['Coefficient'])):
+        plt.text(coef + 0.001*np.sign(coef), i, f'{coef:.3f}', 
+                va='center', fontweight='bold', fontsize=10)
+    
+    # Formatting
+    plt.xlabel('Regression Coefficient', fontweight='bold', fontsize=12)
+    plt.ylabel('Features', fontweight='bold', fontsize=12)
+    plt.title('Feature Importance in Albedo Prediction Model\n'
+              'Linear Regression Coefficients', fontweight='bold', fontsize=14)
+    plt.grid(True, alpha=0.3, axis='x')
+    
+    # Add vertical line at zero
+    plt.axvline(x=0, color='black', linestyle='-', alpha=0.5, linewidth=1)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_station_time_series(station_name, test_data, y_test, y_pred):
+    """
+    Create time series comparison for individual station validation.
+    
+    This detailed view shows how well the model captures temporal patterns
+    in albedo evolution at each glacier site. It helps identify:
+    - Seasonal trends in model performance
+    - Specific periods of poor prediction
+    - Model sensitivity to rapid albedo changes (snowfall events)
+    
+    Parameters:
+    -----------
+    station_name : str
+        Name of station to plot
+    test_data : pd.DataFrame
+        Original test dataset with temporal information
+    y_test : pd.Series
+        True albedo values
+    y_pred : array-like
+        Predicted albedo values
+    """
+    # Extract station-specific data
+    station_mask = test_data['station'] == station_name
+    
+    if not station_mask.any():
+        print(f"Warning: No data found for station {station_name}")
+        return
+    
+    station_data = test_data[station_mask].copy()
+    station_measured = y_test[station_mask]
+    station_predicted = y_pred[station_mask]
+    
+    # Sort data by day of year for proper time series display
+    sort_indices = np.argsort(station_data['day_of_year'].values)
+    days_sorted = station_data['day_of_year'].values[sort_indices]
+    measured_sorted = station_measured.values[sort_indices]
+    predicted_sorted = station_predicted[sort_indices]
+    
+    # Calculate station-specific metrics
+    station_r2 = r2_score(station_measured, station_predicted)
+    station_rmse = np.sqrt(mean_squared_error(station_measured, station_predicted))
+    
+    # Create the time series plot
+    plt.figure(figsize=(14, 8))
+    
+    # Plot measured and predicted albedo
+    plt.plot(days_sorted, measured_sorted, 'b-', linewidth=2.5, 
+             label='Measured Albedo', alpha=0.8, marker='o', markersize=4)
+    plt.plot(days_sorted, predicted_sorted, 'r--', linewidth=2, 
+             label='Predicted Albedo', alpha=0.9, marker='s', markersize=3)
+    
+    # Add shaded area between curves to show prediction error
+    plt.fill_between(days_sorted, measured_sorted, predicted_sorted, 
+                     alpha=0.2, color='gray', label='Prediction Error')
+    
+    # Add performance metrics as text box
+    textstr = f'R² = {station_r2:.3f}\nRMSE = {station_rmse:.3f}\nSamples = {len(station_measured)}'
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+    plt.text(0.02, 0.98, textstr, transform=plt.gca().transAxes, fontsize=11,
+             verticalalignment='top', bbox=props, fontweight='bold')
+    
+    # Formatting
+    plt.xlabel('Day of Year', fontweight='bold', fontsize=12)
+    plt.ylabel('Surface Albedo', fontweight='bold', fontsize=12)
+    plt.title(f'Albedo Prediction Time Series: {station_name.upper()} Station\n'
+              f'Model Validation (2011 Extended Season)', fontweight='bold', fontsize=14)
+    plt.legend(loc='upper right', framealpha=0.9)
+    plt.grid(True, alpha=0.3)
+    
+    # Set reasonable y-axis limits
+    plt.ylim(0, 1)
+    
+    # Add month labels for better temporal reference
+    month_days = [98, 121, 152, 182, 213, 244]  # Approximate mid-month days
+    month_labels = ['Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep']
+    
+    # Only show month labels that fall within the data range
+    valid_months = [(day, label) for day, label in zip(month_days, month_labels) 
+                   if min(days_sorted) <= day <= max(days_sorted)]
+    
+    if valid_months:
+        valid_days, valid_labels = zip(*valid_months)
+        plt.xticks(valid_days, valid_labels)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def main():
+    """
+    Main execution function for albedo prediction model training and validation.
+    
+    This function orchestrates the complete machine learning pipeline:
+    1. Define training and testing datasets with proper temporal separation
+    2. Load and prepare data with seasonal filtering
+    3. Train linear regression model
+    4. Evaluate performance with multiple metrics
+    5. Generate comprehensive visualizations
+    6. Produce publication-ready results
+    
+    Dataset Configuration:
+    - Training: 2010 (hans4, hans9) + 2012 (werenskiold)
+    - Testing: 2011 (hans4, werenskiold) 
+    - Season: Extended ablation period (April 8 - September 4)
+    
+    Note: Some stations/years are commented out for specific experimental design
+    """
+    print("="*60)
+    print("SVALBARD GLACIER ALBEDO PREDICTION MODEL")
+    print("Linear Regression with Snowfall Probability Features")
+    print("="*60)
+    print(f"Analysis started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # ==============================================
+    # Dataset Configuration
+    # ==============================================
+    
+    # Training files: Multi-year data excluding test year (2011)
+    # Strategy: Use different years to test temporal generalization
+    train_files = [
+        "hans4_2010_processed_with_pdd.csv",      # Hansbreen lower station
+        "hans9_2010_processed_with_pdd.csv",      # Hansbreen upper station
+        "werenskiold_2012_processed_with_pdd.csv", # Werenskiöldbreen
+        # Commented out 2011 files (reserved for testing):
+        #"hans4_2011_processed_with_pdd.csv",
+        #"hans9_2011_processed_with_pdd.csv", 
+        #"werenskiold_2011_processed_with_pdd.csv"
+    ]
+    
+    # Testing files: Independent year (2011) for validation
+    # This provides unbiased assessment of model generalization
+    test_files = [
+        "hans4_2011_processed_with_pdd.csv",      # Hansbreen 2011
+        #"hans9_2011_processed_with_pdd.csv",     # Currently excluded
+        "werenskiold_2011_processed_with_pdd.csv" # Werenskiöldbreen 2011
+    ]
+    
+    print(f"\nTraining datasets: {len(train_files)} files")
+    for f in train_files:
+        print(f"  - {f}")
+    
+    print(f"\nTesting datasets: {len(test_files)} files")
+    for f in test_files:
+        print(f"  - {f}")
+    
+    # ==============================================
+    # Data Preparation Pipeline
+    # ==============================================
+    
+    print(f"\n{'-'*40}")
+    print("DATA PREPARATION")
+    print(f"{'-'*40}")
+    
+    # Load and prepare datasets
+    X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_data_clean = prepare_data(
+        train_files, test_files
+    )
+    
+    # Verify data quality
+    if len(X_train_clean) == 0:
+        print("Error: No training data loaded. Check file paths.")
+        return
+    if len(X_test_clean) == 0:
+        print("Error: No testing data loaded. Check file paths.")
+        return
+    
+    # ==============================================
+    # Model Training and Evaluation
+    # ==============================================
+    
+    # Train model and generate comprehensive evaluation
+    model, y_pred, r2, rmse, station_metrics, feature_importance, normalized_importance = train_and_evaluate_model(
+        X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_data_clean
+    )
+    
+    # ==============================================
+    # Results Summary
+    # ==============================================
+    
+    print("\n" + "="*60)
+    print("FINAL RESULTS SUMMARY")
+    print("="*60)
+    print(f"Model Type: Linear Regression")
+    print(f"Season: Extended ablation period (April 8 - September 4)")
+    print(f"Training Period: 2010, 2012")
+    print(f"Testing Period: 2011 (independent validation)")
+    
+    print(f"\nOverall Model Performance:")
+    print(f"  R² Score: {r2:.3f}")
+    print(f"  RMSE: {rmse:.3f}")
+    
+    print(f"\nStation-Specific Performance:")
+    for station, metrics in station_metrics.items():
+        print(f"  {station}:")
+        print(f"    R² Score: {metrics['R2']:.3f}")
+        print(f"    RMSE: {metrics['RMSE']:.3f}")
+        print(f"    Sample Size: {metrics['n_samples']}")
+    
+    print(f"\nFeature Importance (Normalized):")
+    # Sort features by importance for display
+    sorted_features = sorted(normalized_importance.items(), key=lambda x: x[1], reverse=True)
+    for feature, importance in sorted_features:
+        coefficient = feature_importance[feature]
+        print(f"  {feature}:")
+        print(f"    Coefficient: {coefficient:+.3f}")
+        print(f"    Importance: {importance:.3f} ({importance*100:.1f}%)")
+    
+    # ==============================================
+    # Visualization Generation
+    # ==============================================
+    
+    print(f"\n{'-'*40}")
+    print("GENERATING VISUALIZATIONS")
+    print(f"{'-'*40}")
+    
+    # Create main diagnostic plots
+    print("Creating predicted vs. measured scatter plot...")
+    plot_predicted_vs_measured(y_test_clean, y_pred, test_data_clean)
+    
+    print("Creating feature importance plot...")
+    plot_feature_importance(feature_importance)
+    
+    # Create individual station time series plots
+    print("Creating station-specific time series plots...")
+    for station in test_data_clean['station'].unique():
+        print(f"  Plotting time series for {station}...")
+        plot_station_time_series(station, test_data_clean, y_test_clean, y_pred)
+    
+    # ==============================================
+    # Model Interpretation and Insights
+    # ==============================================
+    
+    print(f"\n{'-'*40}")
+    print("MODEL INTERPRETATION")
+    print(f"{'-'*40}")
+    
+    # Analyze snowfall probability as key predictor
+    snowfall_coef = feature_importance['snowfall_probability']
+    snowfall_importance = normalized_importance['snowfall_probability']
+    
+    print(f"\nSnowfall Probability Analysis:")
+    print(f"  Coefficient: {snowfall_coef:+.3f}")
+    print(f"  Relative Importance: {snowfall_importance:.1%}")
+    print(f"  Interpretation: {abs(snowfall_coef):.3f} albedo change per unit probability")
+    
+    if snowfall_coef > 0:
+        print(f"  → Higher snowfall probability → Higher albedo (expected)")
+    else:
+        print(f"  → Higher snowfall probability → Lower albedo (unexpected - investigate)")
+    
+    # Temperature effect analysis
+    temp_coef = feature_importance['TC']
+    temp_importance = normalized_importance['TC']
+    
+    print(f"\nTemperature Effect Analysis:")
+    print(f"  Coefficient: {temp_coef:+.3f}")
+    print(f"  Relative Importance: {temp_importance:.1%}")
+    print(f"  Interpretation: {abs(temp_coef):.3f} albedo change per °C")
+    
+    if temp_coef < 0:
+        print(f"  → Higher temperature → Lower albedo (melting effect)")
+    else:
+        print(f"  → Higher temperature → Higher albedo (unusual - check data)")
+    
+    # Seasonal cycle analysis
+    seasonal_coef = feature_importance['day_of_year']
+    seasonal_importance = normalized_importance['day_of_year']
+    
+    print(f"\nSeasonal Cycle Analysis:")
+    print(f"  Coefficient: {seasonal_coef:+.3f}")
+    print(f"  Relative Importance: {seasonal_importance:.1%}")
+    print(f"  Interpretation: {abs(seasonal_coef):.3f} albedo change per day")
+    
+    # PDD (melting potential) analysis
+    pdd_coef = feature_importance['pdd']
+    pdd_importance = normalized_importance['pdd']
+    
+    print(f"\nPositive Degree Days (Melting) Analysis:")
+    print(f"  Coefficient: {pdd_coef:+.3f}")
+    print(f"  Relative Importance: {pdd_importance:.1%}")
+    print(f"  Interpretation: {abs(pdd_coef):.3f} albedo change per degree-day")
+    
+    if pdd_coef < 0:
+        print(f"  → More cumulative melting → Lower albedo (expected)")
+    else:
+        print(f"  → More cumulative melting → Higher albedo (unexpected)")
+    
+    # ==============================================
+    # Final Recommendations
+    # ==============================================
+    
+    print(f"\n{'-'*40}")
+    print("RECOMMENDATIONS FOR PUBLICATION")
+    print(f"{'-'*40}")
+    
+    print(f"\nModel Performance Assessment:")
+    if r2 > 0.7:
+        print(f"  ✓ Excellent model performance (R² = {r2:.3f})")
+    elif r2 > 0.5:
+        print(f"  ✓ Good model performance (R² = {r2:.3f})")
+    elif r2 > 0.3:
+        print(f"  ⚠ Moderate model performance (R² = {r2:.3f})")
+    else:
+        print(f"  ⚠ Poor model performance (R² = {r2:.3f}) - investigate further")
+    
+    print(f"\nSnowfall Probability Validation:")
+    if snowfall_importance > 0.3:
+        print(f"  ✓ Snowfall probability is dominant predictor ({snowfall_importance:.1%})")
+        print(f"  → Strong validation of snowfall calculation methodology")
+    elif snowfall_importance > 0.15:
+        print(f"  ✓ Snowfall probability is important predictor ({snowfall_importance:.1%})")
+        print(f"  → Moderate validation of snowfall calculation methodology")
+    else:
+        print(f"  ⚠ Snowfall probability has low importance ({snowfall_importance:.1%})")
+        print(f"  → Review snowfall calculation parameters")
+    
+    print(f"\nSpatial Generalization:")
+    station_r2_values = [metrics['R2'] for metrics in station_metrics.values()]
+    if len(station_r2_values) > 1:
+        r2_std = np.std(station_r2_values)
+        if r2_std < 0.1:
+            print(f"  ✓ Consistent performance across stations (σ = {r2_std:.3f})")
+        else:
+            print(f"  ⚠ Variable performance across stations (σ = {r2_std:.3f})")
+            print(f"  → Consider station-specific model refinements")
+    
+    print(f"\nNext Steps:")
+    print(f"  1. Validate results with additional years of data")
+    print(f"  2. Consider non-linear models if R² < 0.7")
+    print(f"  3. Investigate outliers and poor prediction periods")
+    print(f"  4. Compare with alternative snowfall detection methods")
+    print(f"  5. Extend to additional Svalbard glacier sites")
+    
+    print(f"\n{'='*60}")
+    print(f"Analysis completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
+
+
+# ==============================================
+# Script Execution Entry Point
+# ==============================================
+
+if __name__ == "__main__":
+    """
+    Execute the complete albedo prediction analysis when script is run directly.
+    
+    This allows the script to be:
+    1. Run directly for complete analysis
+    2. Imported as a module for individual function use
+    3. Integrated into larger analysis pipelines
+    
+    The main() function provides a complete, reproducible workflow for:
+    - Loading and preparing glacier datasets
+    - Training machine learning models
+    - Validating snowfall probability calculations
+    - Generating publication-ready results and figures
+    """
+    main()
