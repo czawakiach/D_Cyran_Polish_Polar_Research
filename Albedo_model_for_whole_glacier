@@ -1,0 +1,508 @@
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.transform import from_bounds
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from datetime import datetime, timedelta
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+import warnings
+warnings.filterwarnings('ignore')
+
+class SpatialAlbedoModel:
+    """
+    Class for spatial albedo modeling across glacier surfaces using DEM and AWS data.
+    Uses linear regression to extrapolate point-based AWS albedo measurements across 
+    the entire glacier surface based on meteorological and topographic variables.
+    """
+    
+    def __init__(self, dem_paths, aws_data_paths, station_elevations):
+        """
+        Initialize the spatial albedo model
+        
+        Parameters:
+        dem_paths (dict): Paths to DEM files for each glacier
+        aws_data_paths (dict): Paths to AWS station data files  
+        station_elevations (dict): Elevation of each AWS station in meters
+        """
+        self.dem_paths = dem_paths
+        self.aws_data_paths = aws_data_paths
+        self.station_elevations = station_elevations
+        
+        # Storage for loaded data and trained models
+        self.dems = {}
+        self.aws_data = {}
+        self.model = None
+        self.imputer = None
+        
+    def load_dems(self):
+        """Load Digital Elevation Model data for each glacier"""
+        for glacier_name, dem_path in self.dem_paths.items():
+            try:
+                with rasterio.open(dem_path) as src:
+                    elevation = src.read(1)
+                    transform = src.transform
+                    crs = src.crs
+                    
+                    # Handle NoData values (typically -9999 in DEM files)
+                    elevation = elevation.astype(float)
+                    elevation[elevation <= -9999] = np.nan
+                    
+                    # Create coordinate arrays for spatial referencing
+                    height, width = elevation.shape
+                    cols, rows = np.meshgrid(np.arange(width), np.arange(height))
+                    xs, ys = rasterio.transform.xy(transform, rows, cols)
+                    
+                    # Store DEM data and metadata
+                    self.dems[glacier_name] = {
+                        'elevation': elevation,
+                        'transform': transform,
+                        'crs': crs,
+                        'x_coords': np.array(xs),
+                        'y_coords': np.array(ys),
+                        'shape': elevation.shape
+                    }
+                    
+                print(f"Loaded DEM for {glacier_name}: {elevation.shape}")
+                
+                # Report DEM statistics
+                valid_elevation = elevation[~np.isnan(elevation)]
+                if len(valid_elevation) > 0:
+                    print(f"  Elevation range: {np.min(valid_elevation):.1f} - {np.max(valid_elevation):.1f} m")
+                    print(f"  Valid pixels: {len(valid_elevation):,} / {elevation.size:,}")
+                
+            except Exception as e:
+                print(f"Error loading DEM for {glacier_name}: {e}")
+    
+    def load_aws_data(self):
+        """Load Automatic Weather Station data for model training"""
+        for station_name, data_path in self.aws_data_paths.items():
+            try:
+                df = pd.read_csv(data_path)
+                df['date'] = pd.to_datetime(df['date'])
+                
+                # Remove rows with missing albedo values (target variable)
+                initial_len = len(df)
+                df = df.dropna(subset=['albedo'])
+                final_len = len(df)
+                
+                self.aws_data[station_name] = df
+                print(f"Loaded AWS data for {station_name}: {final_len:,} records")
+                if initial_len != final_len:
+                    print(f"  Removed {initial_len-final_len} records with missing albedo")
+                print(f"  Date range: {df['date'].min()} to {df['date'].max()}")
+                
+            except Exception as e:
+                print(f"Error loading AWS data for {station_name}: {e}")
+    
+    def calculate_topographic_variables(self, glacier_name):
+        """
+        Calculate slope and aspect from DEM using gradient analysis
+        
+        Parameters:
+        glacier_name (str): Name of the glacier to process
+        
+        Returns:
+        tuple: (slope, aspect) arrays in degrees
+        """
+        dem_data = self.dems[glacier_name]
+        elevation = dem_data['elevation']
+        
+        # Calculate elevation gradients in x and y directions
+        dy, dx = np.gradient(elevation)
+        
+        # Calculate slope (steepness) in degrees
+        slope = np.arctan(np.sqrt(dx**2 + dy**2)) * 180 / np.pi
+        
+        # Calculate aspect (direction of steepest descent) in degrees (0-360)
+        aspect = np.arctan2(-dx, dy) * 180 / np.pi
+        aspect[aspect < 0] += 360  # Convert to 0-360 range
+        
+        # Store calculated topographic variables
+        self.dems[glacier_name]['slope'] = slope
+        self.dems[glacier_name]['aspect'] = aspect
+        
+        print(f"Calculated topographic variables for {glacier_name}")
+        
+        return slope, aspect
+    
+    def train_model_from_data(self):
+        """
+        Train linear regression model using all available AWS station data.
+        Combines data from all stations to create a comprehensive training dataset.
+        """
+        # Combine data from all AWS stations
+        all_data = []
+        for station_name, df in self.aws_data.items():
+            station_df = df.copy()
+            # Add station elevation as a feature
+            station_df['elevation'] = self.station_elevations[station_name]
+            all_data.append(station_df)
+        
+        # Create combined training dataset
+        combined_df = pd.concat(all_data, ignore_index=True)
+        
+        # Final check for missing albedo values
+        combined_df = combined_df.dropna(subset=['albedo'])
+        print(f"Training dataset: {len(combined_df):,} records from {len(self.aws_data)} stations")
+        
+        # Define features for albedo prediction
+        feature_cols = ['day_of_year', 'TC', 'pdd', 'snowfall_probability', 'elevation']
+        X = combined_df[feature_cols]
+        y = combined_df['albedo']
+        
+        # Handle missing values in feature variables using mean imputation
+        self.imputer = SimpleImputer(strategy='mean')
+        X_clean = self.imputer.fit_transform(X)
+        
+        # Train linear regression model
+        self.model = LinearRegression()
+        self.model.fit(X_clean, y)
+        
+        # Report model performance
+        r2_score = self.model.score(X_clean, y)
+        print(f"Trained linear regression model:")
+        print(f"  Features: {feature_cols}")
+        print(f"  R² score: {r2_score:.3f}")
+        print(f"  Model coefficients: {self.model.coef_}")
+        
+        return self.model
+    
+    def interpolate_meteorological_variables(self, glacier_name, target_date, lapse_rate_temp=-0.0053):
+        """
+        Interpolate meteorological variables from AWS stations to glacier grid.
+        Uses temperature lapse rate from Ignatiuk et al.: -0.53°C/100m
+        
+        Parameters:
+        glacier_name (str): Name of target glacier
+        target_date (datetime): Date for interpolation
+        lapse_rate_temp (float): Temperature lapse rate (°C/m)
+        
+        Returns:
+        dict: Interpolated meteorological variables on glacier grid
+        """
+        dem_data = self.dems[glacier_name]
+        elevation_grid = dem_data['elevation']
+        
+        # Define approximate AWS station positions on glacier grid (fractional coordinates)
+        station_positions = {
+            'hans4': {'x_frac': 0.7, 'y_frac': 0.5},     # H4 position on Hansbreen
+            'hans9': {'x_frac': 0.3, 'y_frac': 0.2},     # H9 position on Hansbreen
+            'werenskiold': {'x_frac': 0.4, 'y_frac': 0.6} # W position on Werenskioldbreen
+        }
+        
+        # Extract station data for target date
+        station_coords = []
+        station_values = {}
+        
+        for station_name, station_elevation in self.station_elevations.items():
+            if station_name in self.aws_data and station_name in station_positions:
+                station_df = self.aws_data[station_name]
+                
+                # Find data for target date (exact date match)
+                station_df['date_only'] = station_df['date'].dt.date
+                target_date_only = target_date.date()
+                date_mask = station_df['date_only'] == target_date_only
+                
+                if date_mask.any():
+                    station_data = station_df[date_mask].iloc[0]
+                    
+                    # Calculate station position on grid
+                    pos = station_positions[station_name]
+                    x_pos = int(pos['x_frac'] * elevation_grid.shape[1])
+                    y_pos = int(pos['y_frac'] * elevation_grid.shape[0])
+                    
+                    station_coords.append([x_pos, y_pos, station_elevation])
+                    
+                    # Store meteorological variables
+                    for var in ['TC', 'pdd', 'snowfall_probability']:
+                        if var not in station_values:
+                            station_values[var] = []
+                        station_values[var].append(station_data[var])
+                else:
+                    print(f"  No data for {station_name} on {target_date_only}")
+        
+        if not station_coords:
+            print(f"  No station data available for {target_date}")
+            return None
+        
+        station_coords = np.array(station_coords)
+        print(f"  Using {len(station_coords)} stations for interpolation")
+        
+        # Interpolate each meteorological variable across glacier surface
+        interpolated_vars = {}
+        
+        for var_name, values in station_values.items():
+            if var_name == 'TC':
+                # Apply temperature lapse rate for elevation-dependent interpolation
+                mean_elevation = np.nanmean(elevation_grid)
+                adjusted_temps = []
+                
+                # Adjust each station temperature to reference elevation
+                for i, temp in enumerate(values):
+                    station_elev = station_coords[i, 2]
+                    temp_adjusted = temp + lapse_rate_temp * (mean_elevation - station_elev)
+                    adjusted_temps.append(temp_adjusted)
+                
+                # Apply lapse rate to create temperature field
+                mean_temp_ref = np.mean(adjusted_temps)
+                interpolated_vars[var_name] = mean_temp_ref + lapse_rate_temp * (elevation_grid - mean_elevation)
+                
+            else:
+                # For other variables, use elevation-based linear interpolation
+                if len(values) > 1:
+                    elevations = station_coords[:, 2]
+                    elevation_flat = elevation_grid.flatten()
+                    valid_mask = ~np.isnan(elevation_flat)
+                    
+                    if np.any(valid_mask):
+                        interpolated_flat = np.full_like(elevation_flat, np.nan)
+                        # Linear interpolation based on elevation
+                        interpolated_flat[valid_mask] = np.interp(
+                            elevation_flat[valid_mask], 
+                            elevations, 
+                            values
+                        )
+                        interpolated_vars[var_name] = interpolated_flat.reshape(elevation_grid.shape)
+                    else:
+                        interpolated_vars[var_name] = np.full_like(elevation_grid, np.mean(values))
+                else:
+                    # Use constant value if only one station available
+                    interpolated_vars[var_name] = np.full_like(elevation_grid, values[0])
+        
+        return interpolated_vars
+    
+    def predict_spatial_albedo(self, glacier_name, target_date, day_of_year=None):
+        """
+        Predict albedo across entire glacier surface for a specific date
+        
+        Parameters:
+        glacier_name (str): Name of target glacier
+        target_date (datetime): Date for prediction
+        day_of_year (int): Day of year (calculated if not provided)
+        
+        Returns:
+        numpy.ndarray: Predicted albedo values across glacier surface
+        """
+        if day_of_year is None:
+            day_of_year = target_date.timetuple().tm_yday
+        
+        print(f"Predicting albedo for {glacier_name} on {target_date.strftime('%Y-%m-%d')}")
+        
+        # Get interpolated meteorological variables
+        met_vars = self.interpolate_meteorological_variables(glacier_name, target_date)
+        if met_vars is None:
+            print("  Cannot predict: no meteorological data available")
+            return None
+        
+        # Get elevation data
+        dem_data = self.dems[glacier_name]
+        elevation = dem_data['elevation']
+        shape = elevation.shape
+        
+        # Prepare feature arrays for prediction
+        features = {
+            'day_of_year': np.full(shape, day_of_year),
+            'TC': met_vars['TC'],
+            'pdd': met_vars['pdd'],
+            'snowfall_probability': met_vars['snowfall_probability'],
+            'elevation': elevation
+        }
+        
+        # Create feature matrix for valid pixels only
+        valid_mask = ~np.isnan(elevation)
+        if not np.any(valid_mask):
+            print("  No valid elevation data for prediction")
+            return None
+        
+        # Stack features for model input
+        feature_stack = np.column_stack([
+            features['day_of_year'][valid_mask],
+            features['TC'][valid_mask],
+            features['pdd'][valid_mask],
+            features['snowfall_probability'][valid_mask],
+            features['elevation'][valid_mask]
+        ])
+        
+        # Apply imputation to handle any missing values
+        feature_stack_clean = self.imputer.transform(feature_stack)
+        
+        # Predict albedo using trained linear regression model
+        albedo_values = self.model.predict(feature_stack_clean)
+        
+        # Create output array and fill valid pixels
+        albedo_predicted = np.full(shape, np.nan)
+        albedo_predicted[valid_mask] = albedo_values
+        
+        # Clip values to valid albedo range [0, 1]
+        albedo_predicted = np.clip(albedo_predicted, 0, 1)
+        
+        print(f"  Predicted albedo for {np.sum(valid_mask):,} pixels")
+        
+        return albedo_predicted
+    
+    def visualize_spatial_albedo(self, glacier_name, albedo_array, target_date, save_path=None, figsize=(12, 6)):
+        """
+        Create side-by-side visualization of elevation and predicted albedo
+        
+        Parameters:
+        glacier_name (str): Name of glacier
+        albedo_array (numpy.ndarray): Predicted albedo values
+        target_date (datetime): Date of prediction
+        save_path (str): Optional path to save figure
+        figsize (tuple): Figure size in inches
+        """
+        dem_data = self.dems[glacier_name]
+        elevation = dem_data['elevation']
+        
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        
+        # Plot 1: Elevation map
+        im1 = axes[0].imshow(elevation, cmap='terrain', alpha=0.8)
+        axes[0].set_title(f'{glacier_name} - Elevation (m)')
+        axes[0].set_xlabel('Grid X')
+        axes[0].set_ylabel('Grid Y')
+        plt.colorbar(im1, ax=axes[0], shrink=0.8, label='Elevation (m)')
+        
+        # Plot 2: Predicted albedo map
+        albedo_cmap = LinearSegmentedColormap.from_list(
+            'albedo', ['darkblue', 'blue', 'lightblue', 'white'], N=256
+        )
+        
+        im2 = axes[1].imshow(albedo_array, cmap=albedo_cmap, vmin=0, vmax=1)
+        axes[1].set_title(f'{glacier_name} - Predicted Albedo\n{target_date.strftime("%Y-%m-%d")}')
+        axes[1].set_xlabel('Grid X')
+        axes[1].set_ylabel('Grid Y')
+        plt.colorbar(im2, ax=axes[1], shrink=0.8, label='Albedo')
+        
+        # Remove axis ticks for cleaner appearance
+        for ax in axes:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        
+        plt.tight_layout()
+        
+        # Save figure if path provided
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"  Saved visualization to {save_path}")
+        
+        plt.show()
+        
+        # Print albedo statistics
+        valid_albedo = albedo_array[~np.isnan(albedo_array)]
+        if len(valid_albedo) > 0:
+            print(f"\nAlbedo Statistics for {glacier_name}:")
+            print(f"  Mean: {np.mean(valid_albedo):.3f}")
+            print(f"  Std: {np.std(valid_albedo):.3f}")
+            print(f"  Range: {np.min(valid_albedo):.3f} - {np.max(valid_albedo):.3f}")
+            print(f"  Valid pixels: {len(valid_albedo):,}")
+    
+    def create_validation_predictions(self, glacier_names=None):
+        """
+        Create albedo predictions for validation dates (July 26 and August 20, 2011)
+        
+        Parameters:
+        glacier_names (list): List of glacier names to process (default: all loaded glaciers)
+        
+        Returns:
+        dict: Nested dictionary with predictions for each date and glacier
+        """
+        if glacier_names is None:
+            glacier_names = list(self.dems.keys())
+        
+        # Define validation dates matching Landsat acquisition dates
+        validation_dates = [
+            datetime(2011, 7, 26),
+            datetime(2011, 8, 20)
+        ]
+        
+        results = {}
+        
+        for date in validation_dates:
+            date_str = date.strftime('%Y-%m-%d')
+            results[date_str] = {}
+            
+            print(f"\n=== Processing {date_str} ===")
+            
+            for glacier_name in glacier_names:
+                print(f"\nPredicting albedo for {glacier_name}...")
+                
+                # Generate spatial albedo prediction
+                albedo_prediction = self.predict_spatial_albedo(glacier_name, date)
+                
+                if albedo_prediction is not None:
+                    results[date_str][glacier_name] = albedo_prediction
+                    
+                    # Create and save visualization
+                    save_path = f"{glacier_name}_albedo_prediction_{date.strftime('%Y%m%d')}.png"
+                    self.visualize_spatial_albedo(
+                        glacier_name, 
+                        albedo_prediction, 
+                        date,
+                        save_path=save_path
+                    )
+                else:
+                    print(f"  Failed to predict albedo for {glacier_name} on {date_str}")
+        
+        return results
+
+def main():
+    """
+    Main workflow for spatial albedo modeling of Svalbard glaciers
+    
+    Returns:
+    tuple: (spatial_model, validation_results)
+    """
+    print("=== Spatial Albedo Modeling for Svalbard Glaciers ===\n")
+    
+    # Define file paths for DEM data
+    dem_paths = {
+        'Hansbreen': r"D:\PhD\1st_year\1st_article\DEM\Hansbreen_DEM.tif",
+        'Werenskioldbreen': r"D:\PhD\1st_year\1st_article\DEM\Werenskioldbreen_DEM.tif"
+    }
+    
+    # Define file paths for AWS station data
+    aws_data_paths = {
+        'hans4': r"D:\PhD\2nd_year\1st_article\Model_DEM\Stations_processed_data\hans4_2011_cleaned.csv",
+        'hans9': r"D:\PhD\2nd_year\1st_article\Model_DEM\Stations_processed_data\hans9_2011_cleaned.csv",
+        'werenskiold': r"D:\PhD\2nd_year\1st_article\Model_DEM\Stations_processed_data\werenskiold_2011_cleaned.csv"
+    }
+    
+    # Define AWS station elevations (meters above sea level)
+    station_elevations = {
+        'hans4': 190,    # Hansbreen station 4
+        'hans9': 420,    # Hansbreen station 9
+        'werenskiold': 380  # Werenskioldbreen station
+    }
+    
+    # Initialize spatial albedo model
+    spatial_model = SpatialAlbedoModel(dem_paths, aws_data_paths, station_elevations)
+    
+    # Load DEM and AWS data
+    print("Loading DEM and AWS data...")
+    spatial_model.load_dems()
+    spatial_model.load_aws_data()
+    
+    # Calculate topographic variables for each glacier
+    print("\nCalculating topographic variables...")
+    for glacier_name in dem_paths.keys():
+        spatial_model.calculate_topographic_variables(glacier_name)
+    
+    # Train linear regression model using all available AWS data
+    print("\nTraining linear regression model...")
+    spatial_model.train_model_from_data()
+    
+    # Create predictions for validation dates
+    print("\nCreating validation predictions...")
+    validation_results = spatial_model.create_validation_predictions()
+    
+    print("\n=== Spatial Albedo Modeling Complete ===")
+    
+    return spatial_model, validation_results
+
+if __name__ == "__main__":
+    # Execute main workflow
+    model, results = main()
