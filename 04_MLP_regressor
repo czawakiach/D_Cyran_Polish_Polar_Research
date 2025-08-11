@@ -1,62 +1,25 @@
 """
 Multi-Layer Perceptron Neural Network for Albedo Prediction on Svalbard Glaciers
-================================================================================
 
-This script implements a deep learning approach to predict glacier surface albedo
-using Multi-Layer Perceptron (MLP) neural networks. This advanced modeling technique
-captures non-linear relationships between meteorological variables and albedo that
-linear models cannot detect, providing insights into complex glacier-atmosphere
-interactions during the Arctic ablation season.
+This script implements a deep learning approach to glacier albedo prediction using
+Multi-Layer Perceptron neural networks. Tests whether non-linear relationships
+between meteorological variables and albedo provide superior predictive performance
+compared to linear regression baselines.
 
 Scientific Motivation:
-Glacier albedo dynamics involve complex, non-linear processes that may not be
-adequately captured by linear regression approaches:
-- Non-linear temperature-albedo relationships (phase transitions, feedback loops)
-- Complex interactions between temperature, precipitation, and radiation
-- Threshold effects in snowfall accumulation and melting processes
-- Multi-scale temporal dependencies (daily vs. seasonal patterns)
-
-Neural Network Advantages:
-- Captures non-linear relationships and feature interactions
-- Automatic feature engineering through hidden layers
-- Robust to noise and missing data with proper regularization
-- Can model complex threshold behaviors and feedback mechanisms
+- Glacier albedo involves complex, non-linear processes (phase transitions, feedbacks)
+- Neural networks can capture threshold effects and feature interactions
 - Provides benchmark for maximum achievable prediction accuracy
+- Model-agnostic feature importance through permutation analysis
 
 Model Architecture:
-- Multi-Layer Perceptron (MLP) with customizable hidden layers
-- Input normalization for optimal neural network performance
-- Regularization techniques (L2, early stopping) to prevent overfitting
-- Hyperparameter optimization for optimal performance
-- Permutation-based feature importance for interpretability
+- Multi-Layer Perceptron with hidden layers (100-50 neurons)
+- ReLU activation for non-linear learning
+- Adam optimizer with early stopping
+- L2 regularization to prevent overfitting
+- Feature standardization for optimal training
 
-Comparison Framework:
-This neural network approach complements the linear models by:
-1. Testing for non-linear improvements over linear baselines
-2. Identifying complex feature interactions
-3. Providing upper bound on predictive performance
-4. Validating linear model assumptions through residual analysis
-
-Training Strategy:
-- Same temporal separation as linear models (2010, 2012 train; 2011 test)
-- Feature standardization for neural network optimization
-- Cross-validation for hyperparameter tuning
-- Early stopping to prevent overfitting
-- Permutation importance for interpretable feature ranking
-
-Author: Dominik Cyran
-Institution: University of Silesia in Katowice
-Date: 03/08/2025
-Version: 1.0
-
-Dependencies:
-- pandas, numpy, scikit-learn
-- matplotlib, seaborn
-- pathlib, datetime
-
-Related Scripts:
-- Linear regression models (comparison baselines)
-- Snowfall probability calculation (feature generation)
+Dependencies: pandas, numpy, scikit-learn, matplotlib
 """
 
 import pandas as pd
@@ -74,210 +37,131 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 
-
 def load_and_combine_data(train_files, test_files):
     """
     Load and combine meteorological datasets for neural network training.
     
-    Neural networks require substantial data volumes for effective training,
-    making proper dataset combination and validation crucial for model success.
-    This function handles the data loading pipeline with enhanced error checking
-    for deep learning applications.
-    
-    Data Requirements for Neural Networks:
-    - Sufficient sample size (typically >1000 observations for stable training)
-    - Feature diversity across meteorological conditions
-    - Temporal coverage spanning multiple seasonal cycles
-    - Quality control for outliers and measurement artifacts
+    Neural networks require substantial data volumes for effective training.
+    Includes validation for data sufficiency and quality control.
     
     Parameters:
-    -----------
-    train_files : list of str
-        Training dataset file paths for neural network calibration
-        Expected format: {station}_{year}_processed_with_pdd.csv
-    test_files : list of str
-        Independent testing dataset paths for model validation
-        
+    train_files (list): Training dataset file paths
+    test_files (list): Testing dataset file paths
+    
     Returns:
-    --------
-    tuple of pd.DataFrame
-        (train_df, test_df) - Combined datasets ready for neural network processing
+    tuple: (train_df, test_df) combined datasets
     """
     print("\n" + "="*60)
     print("LOADING DATA FOR NEURAL NETWORK TRAINING")
     print("="*60)
     
-    # Load and validate training datasets
+    # Load training datasets with validation
     train_dfs = []
-    total_train_samples = 0
-    
     for file_path in train_files:
         try:
             df = pd.read_csv(file_path)
             
-            # Validate neural network data requirements
+            # Neural network data quality checks
             if len(df) < 50:
                 print(f"⚠ Warning: Small dataset in {file_path} ({len(df)} samples)")
-                print("  Neural networks perform better with larger datasets")
             
-            # Check for extreme outliers that could affect neural network training
+            # Check for extreme outliers
             numeric_cols = df.select_dtypes(include=[np.number]).columns
-            for col in numeric_cols:
-                if col in ['TC', 'albedo', 'pdd']:  # Key variables for outlier detection
-                    q99 = df[col].quantile(0.99)
-                    q01 = df[col].quantile(0.01)
+            for col in ['TC', 'albedo', 'pdd']:
+                if col in numeric_cols:
+                    q99, q01 = df[col].quantile(0.99), df[col].quantile(0.01)
                     outliers = ((df[col] > q99) | (df[col] < q01)).sum()
-                    if outliers > len(df) * 0.05:  # More than 5% outliers
+                    if outliers > len(df) * 0.05:
                         print(f"  ⚠ High outlier rate in {col}: {outliers}/{len(df)} ({outliers/len(df)*100:.1f}%)")
             
             train_dfs.append(df)
-            total_train_samples += len(df)
             print(f"✓ Loaded training: {file_path} ({len(df)} samples)")
             
         except FileNotFoundError:
             print(f"✗ Training file not found: {file_path}")
         except Exception as e:
-            print(f"✗ Error loading training file {file_path}: {e}")
+            print(f"✗ Error loading: {file_path}: {e}")
     
-    # Load and validate testing datasets
+    # Load testing datasets
     test_dfs = []
-    total_test_samples = 0
-    
     for file_path in test_files:
         try:
             df = pd.read_csv(file_path)
             test_dfs.append(df)
-            total_test_samples += len(df)
             print(f"✓ Loaded testing: {file_path} ({len(df)} samples)")
-            
         except FileNotFoundError:
             print(f"✗ Testing file not found: {file_path}")
         except Exception as e:
-            print(f"✗ Error loading testing file {file_path}: {e}")
+            print(f"✗ Error loading: {file_path}: {e}")
     
-    # Combine datasets with neural network validation
+    # Combine datasets
     train_combined = pd.concat(train_dfs, ignore_index=True) if train_dfs else pd.DataFrame()
     test_combined = pd.concat(test_dfs, ignore_index=True) if test_dfs else pd.DataFrame()
     
     print(f"\nNeural Network Dataset Assessment:")
     print(f"  Training samples: {len(train_combined)}")
     print(f"  Testing samples: {len(test_combined)}")
-    print(f"  Total samples: {len(train_combined) + len(test_combined)}")
     
-    # Neural network data sufficiency assessment
+    # Data sufficiency assessment
     if len(train_combined) < 500:
         print(f"  ⚠ WARNING: Limited training data for neural networks")
-        print(f"    Recommendation: Combine multiple years or consider simpler models")
     elif len(train_combined) < 1000:
-        print(f"  ⚠ CAUTION: Moderate training data for neural networks")
-        print(f"    Recommendation: Use regularization and early stopping")
+        print(f"  ⚠ CAUTION: Moderate training data - use regularization")
     else:
         print(f"  ✓ GOOD: Sufficient training data for neural networks")
     
     return train_combined, test_combined
 
-
 def filter_season(df, year_col='year', doy_col='day_of_year'):
     """
     Apply seasonal filtering optimized for neural network training.
     
-    Neural networks benefit from focused seasonal windows that maximize
-    signal-to-noise ratios and reduce temporal complexity. The extended
-    ablation season provides optimal conditions for learning albedo-
-    meteorology relationships while minimizing low-information periods.
-    
-    Neural Network Seasonal Considerations:
-    - Concentrated temporal signal reduces model complexity requirements
-    - Removes low-variance winter periods that add noise
-    - Focuses on dynamic albedo-meteorology relationships
-    - Maintains sufficient temporal diversity for robust learning
+    Focuses on extended ablation season for maximum signal-to-noise ratio
+    and optimal albedo-meteorology relationship learning.
     
     Parameters:
-    -----------
-    df : pd.DataFrame
-        Input meteorological dataset
-    year_col : str, default 'year'
-        Column containing year information
-    doy_col : str, default 'day_of_year'
-        Column containing day of year (1-365/366)
+    df (pd.DataFrame): Input dataset
+    year_col (str): Year column name
+    doy_col (str): Day of year column name
     
     Returns:
-    --------
-    pd.DataFrame
-        Seasonally filtered dataset optimized for neural network training
+    pd.DataFrame: Seasonally filtered dataset
     """
-    # Define neural network optimized seasonal boundaries
-    spring_start_doy = 98   # April 8th - onset of dynamic albedo variability
-    end_date_doy = 247      # September 4th - end of primary signal period
+    spring_start_doy = 98   # April 8 - onset of dynamic albedo variability
+    end_date_doy = 247      # September 4 - end of primary signal period
     
     # Apply seasonal mask
     season_mask = (df[doy_col] >= spring_start_doy) & (df[doy_col] <= end_date_doy)
     filtered_df = df[season_mask].copy()
     
     print(f"\nNeural Network Seasonal Filtering:")
-    print(f"  Original dataset: {len(df)} samples")
-    print(f"  Filtered dataset: {len(filtered_df)} samples ({len(filtered_df)/len(df)*100:.1f}%)")
+    print(f"  Original: {len(df)} → Filtered: {len(filtered_df)} samples ({len(filtered_df)/len(df)*100:.1f}%)")
     print(f"  Season focus: High signal-to-noise period (Day {spring_start_doy}-{end_date_doy})")
     
     # Analyze data characteristics for neural network training
-    if len(filtered_df) > 0:
-        # Check temporal distribution
-        if doy_col in filtered_df.columns:
-            temporal_span = filtered_df[doy_col].max() - filtered_df[doy_col].min()
-            print(f"  Temporal span: {temporal_span} days")
-            
-        # Check target variable distribution for neural network optimization
-        if 'albedo' in filtered_df.columns:
-            albedo_stats = filtered_df['albedo'].describe()
-            print(f"  Albedo range: {albedo_stats['min']:.3f} to {albedo_stats['max']:.3f}")
-            print(f"  Albedo variance: {albedo_stats['std']:.3f} (good variance aids NN training)")
-            
-        # Check for sufficient variability in features
-        numeric_cols = filtered_df.select_dtypes(include=[np.number]).columns
-        low_variance_features = []
-        for col in numeric_cols:
-            if filtered_df[col].std() < 0.01:  # Very low variance
-                low_variance_features.append(col)
-        
-        if low_variance_features:
-            print(f"  ⚠ Low variance features (may hurt NN training): {low_variance_features}")
+    if len(filtered_df) > 0 and 'albedo' in filtered_df.columns:
+        albedo_stats = filtered_df['albedo'].describe()
+        print(f"  Albedo range: {albedo_stats['min']:.3f} to {albedo_stats['max']:.3f}")
+        print(f"  Albedo variance: {albedo_stats['std']:.3f} (good variance aids NN training)")
     
     return filtered_df
 
-
 def prepare_data(train_files, test_files):
     """
-    Comprehensive data preparation pipeline for neural network training.
+    Comprehensive data preparation for neural network training.
     
-    Neural networks require careful data preprocessing to achieve optimal
-    performance. This preparation pipeline handles the complete workflow
-    from raw meteorological data to neural network-ready feature matrices.
-    
-    Neural Network Data Preparation Steps:
-    1. Load and validate datasets for sufficient sample size
-    2. Apply seasonal filtering for optimal signal extraction
-    3. Define feature set with neural network considerations
-    4. Handle missing values with neural network-appropriate methods
-    5. Prepare clean datasets for standardization and training
-    
-    Feature Engineering for Neural Networks:
-    - Balanced feature set avoiding dominance by any single variable
-    - Numeric features suitable for gradient-based optimization
-    - Sufficient feature diversity for meaningful learning
-    - Quality control for neural network stability
+    Handles complete workflow from raw data to neural network-ready matrices:
+    1. Load and validate datasets
+    2. Apply seasonal filtering
+    3. Define feature set for neural network learning
+    4. Handle missing values appropriately
     
     Parameters:
-    -----------
-    train_files : list of str
-        Training data file paths for neural network calibration
-    test_files : list of str
-        Testing data file paths for independent validation
+    train_files (list): Training data paths
+    test_files (list): Testing data paths
     
     Returns:
-    --------
-    tuple
-        X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_df
-        Clean datasets ready for neural network standardization and training
+    tuple: X_train, X_test, y_train, y_test, test_df (cleaned datasets)
     """
     print("\n" + "="*60)
     print("NEURAL NETWORK DATA PREPARATION PIPELINE")
@@ -291,60 +175,44 @@ def prepare_data(train_files, test_files):
     test_df = filter_season(test_df)
     
     # Define neural network feature set
-    # Features selected for neural network learning characteristics:
     feature_cols = [
         'TC',                   # Temperature: continuous, high-impact variable
-        'pdd',                  # Positive degree days: cumulative thermal information
+        'pdd',                  # Positive degree days: cumulative thermal info
         'day_of_year',          # Seasonal patterns: cyclical information
         'snowfall_probability'  # Precipitation proxy: probability-based feature
     ]
     
     print(f"\nNeural Network Feature Set:")
-    print(f"  Selected features: {len(feature_cols)}")
     for i, feature in enumerate(feature_cols, 1):
         if feature == 'TC':
             print(f"  {i}. {feature} ← Primary thermal driver (continuous)")
         elif feature == 'pdd':
-            print(f"  {i}. {feature} ← Cumulative thermal history (memory)")
+            print(f"  {i}. {feature} ← Cumulative thermal history")
         elif feature == 'snowfall_probability':
-            print(f"  {i}. {feature} ← Precipitation processes (probability)")
+            print(f"  {i}. {feature} ← Precipitation processes")
         else:
-            print(f"  {i}. {feature} ← Seasonal patterns (cyclical)")
-    
-    # Validate feature availability
-    missing_features_train = [f for f in feature_cols if f not in train_df.columns]
-    missing_features_test = [f for f in feature_cols if f not in test_df.columns]
-    
-    if missing_features_train:
-        print(f"  ✗ Missing training features: {missing_features_train}")
-    if missing_features_test:
-        print(f"  ✗ Missing testing features: {missing_features_test}")
+            print(f"  {i}. {feature} ← Seasonal patterns")
     
     # Extract features and targets
     X_train = train_df[feature_cols]
-    y_train = train_df['albedo']  # Target: surface albedo (0-1 scale)
-    
+    y_train = train_df['albedo']
     X_test = test_df[feature_cols]
     y_test = test_df['albedo']
     
     # Neural network-appropriate missing value imputation
-    # Mean imputation preserves distributions and avoids bias
     feature_imputer = SimpleImputer(strategy='mean')
+    target_imputer = SimpleImputer(strategy='mean')
     
     print(f"\nApplying neural network-appropriate imputation...")
     X_train_clean = pd.DataFrame(
         feature_imputer.fit_transform(X_train),
-        columns=X_train.columns,
-        index=X_train.index
+        columns=X_train.columns, index=X_train.index
     )
     X_test_clean = pd.DataFrame(
         feature_imputer.transform(X_test),
-        columns=X_test.columns,
-        index=X_test.index
+        columns=X_test.columns, index=X_test.index
     )
     
-    # Handle missing target values (albedo)
-    target_imputer = SimpleImputer(strategy='mean')
     y_train_clean = pd.Series(
         target_imputer.fit_transform(y_train.values.reshape(-1, 1)).ravel(),
         index=y_train.index
@@ -354,33 +222,19 @@ def prepare_data(train_files, test_files):
         index=y_test.index
     )
     
-    # Neural network data quality assessment
-    print(f"\nNeural Network Data Quality Assessment:")
-    print(f"{'='*50}")
+    # Data quality assessment
+    print(f"\nNeural Network Data Quality:")
+    print(f"  Training samples: {len(X_train_clean)}")
+    print(f"  Testing samples: {len(X_test_clean)}")
     
-    # Check missing values
-    print(f"\nMissing values before imputation:")
-    missing_train = X_train.isna().sum()
-    for feature, missing_count in missing_train.items():
-        if missing_count > 0:
-            pct_missing = missing_count / len(X_train) * 100
-            status = "⚠ HIGH" if pct_missing > 10 else "✓ Acceptable"
-            print(f"  {feature}: {missing_count} missing ({pct_missing:.1f}%) {status}")
-        else:
-            print(f"  {feature}: Complete data ✓")
-    
-    # Analyze feature distributions for neural network suitability
+    # Feature distribution analysis
     print(f"\nFeature Distribution Analysis:")
     for feature in feature_cols:
         if feature in X_train_clean.columns:
-            feature_stats = X_train_clean[feature].describe()
-            feature_range = feature_stats['max'] - feature_stats['min']
+            stats = X_train_clean[feature].describe()
+            feature_range = stats['max'] - stats['min']
             
-            print(f"  {feature}:")
-            print(f"    Range: {feature_stats['min']:.3f} to {feature_stats['max']:.3f} (span: {feature_range:.3f})")
-            print(f"    Mean: {feature_stats['mean']:.3f}, Std: {feature_stats['std']:.3f}")
-            
-            # Check for potential scaling issues
+            print(f"  {feature}: range {stats['min']:.3f} to {stats['max']:.3f}")
             if feature_range > 1000:
                 print(f"    ⚠ Large range - standardization essential")
             elif feature_range < 0.01:
@@ -389,138 +243,87 @@ def prepare_data(train_files, test_files):
                 print(f"    ✓ Good range for neural networks")
     
     # Target variable analysis
-    print(f"\nTarget Variable Analysis (Albedo):")
     target_stats = y_train_clean.describe()
+    print(f"\nTarget Variable (Albedo):")
     print(f"  Range: {target_stats['min']:.3f} to {target_stats['max']:.3f}")
-    print(f"  Mean: {target_stats['mean']:.3f}, Std: {target_stats['std']:.3f}")
-    
-    if target_stats['std'] < 0.05:
-        print(f"  ⚠ Low target variance - neural networks may struggle")
-    else:
-        print(f"  ✓ Good target variance for neural network learning")
-    
-    print(f"\nFinal Neural Network Dataset:")
-    print(f"  Training samples: {len(X_train_clean)}")
-    print(f"  Testing samples: {len(X_test_clean)}")
-    print(f"  Features: {len(feature_cols)}")
-    print(f"  Ready for standardization and neural network training")
+    print(f"  Variance: {target_stats['std']:.3f} {'✓ Good' if target_stats['std'] > 0.05 else '⚠ Low'}")
     
     return X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_df
 
-
 def train_and_evaluate_mlp(X_train, X_test, y_train, y_test, test_data):
     """
-    Train and evaluate Multi-Layer Perceptron neural network for albedo prediction.
+    Train and evaluate Multi-Layer Perceptron for albedo prediction.
     
-    This function implements a comprehensive neural network training pipeline
-    with best practices for glaciological applications. The MLP architecture
-    is designed to capture non-linear relationships between meteorological
-    variables and glacier albedo while preventing overfitting.
-    
-    Neural Network Architecture:
-    - Multi-layer perceptron with configurable hidden layers
-    - ReLU activation for non-linear feature learning
-    - Adam optimizer for efficient gradient-based learning
-    - L2 regularization to prevent overfitting
-    - Early stopping for optimal generalization
-    
-    Training Strategy:
+    Implements comprehensive neural network pipeline:
     - Feature standardization for optimal convergence
-    - Validation split for early stopping monitoring
-    - Reproducible random seed for consistent results
-    - Conservative hyperparameters for stable training
-    
-    Evaluation Framework:
-    - Overall performance metrics (R², RMSE)
-    - Station-specific validation for spatial generalization
-    - Permutation-based feature importance for interpretability
-    - Comparison benchmarks against linear models
+    - MLP architecture designed for glaciological regression
+    - Early stopping and regularization to prevent overfitting
+    - Comprehensive performance evaluation
     
     Parameters:
-    -----------
-    X_train : pd.DataFrame
-        Training feature matrix
-    X_test : pd.DataFrame
-        Testing feature matrix
-    y_train : pd.Series
-        Training albedo targets
-    y_test : pd.Series
-        Testing albedo targets
-    test_data : pd.DataFrame
-        Original test dataset for spatial analysis
+    X_train, X_test (pd.DataFrame): Feature matrices
+    y_train, y_test (pd.Series): Target vectors
+    test_data (pd.DataFrame): Original test data for analysis
     
     Returns:
-    --------
-    tuple
-        Complete neural network evaluation results and trained model
+    tuple: model, scaler, predictions, metrics
     """
     print("\n" + "="*60)
     print("NEURAL NETWORK TRAINING AND EVALUATION")
     print("="*60)
     
     # Feature standardization for neural network optimization
-    # Neural networks require standardized inputs for stable training
-    print("Applying feature standardization for neural network training...")
+    print("Applying feature standardization...")
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    # Check standardization quality
+    # Verify standardization
     print(f"Standardization validation:")
     print(f"  Training features mean: {X_train_scaled.mean(axis=0).round(3)}")
     print(f"  Training features std: {X_train_scaled.std(axis=0).round(3)}")
-    print(f"  ✓ Features centered around 0 with unit variance")
     
     # Configure Multi-Layer Perceptron architecture
-    # Architecture designed for glaciological regression tasks
     mlp = MLPRegressor(
         hidden_layer_sizes=(100, 50),    # Two hidden layers: 100 → 50 neurons
         activation='relu',               # ReLU for non-linear learning
-        solver='adam',                   # Adam optimizer for efficient training
-        alpha=0.0001,                   # L2 regularization (conservative)
-        max_iter=1000,                  # Maximum training iterations
+        solver='adam',                   # Adam optimizer
+        alpha=0.0001,                   # L2 regularization
+        max_iter=1000,                  # Maximum iterations
         early_stopping=True,            # Prevent overfitting
-        validation_fraction=0.1,        # 10% validation for early stopping
-        n_iter_no_change=10,           # Patience for early stopping
+        validation_fraction=0.1,        # 10% validation split
+        n_iter_no_change=10,           # Early stopping patience
         random_state=42                 # Reproducible results
     )
     
     print(f"\nNeural Network Architecture:")
     print(f"  Input layer: {X_train.shape[1]} features")
-    print(f"  Hidden layer 1: 100 neurons (ReLU activation)")
-    print(f"  Hidden layer 2: 50 neurons (ReLU activation)")
-    print(f"  Output layer: 1 neuron (linear activation)")
+    print(f"  Hidden layer 1: 100 neurons (ReLU)")
+    print(f"  Hidden layer 2: 50 neurons (ReLU)")
+    print(f"  Output layer: 1 neuron (linear)")
     print(f"  Total parameters: ~{(X_train.shape[1] * 100) + (100 * 50) + (50 * 1):,}")
     
     print(f"\nTraining Configuration:")
-    print(f"  Optimizer: Adam (adaptive learning rate)")
-    print(f"  Regularization: L2 (α = 0.0001)")
-    print(f"  Early stopping: Enabled (patience = 10)")
-    print(f"  Validation fraction: 10%")
-    print(f"  Maximum iterations: 1000")
+    print(f"  Optimizer: Adam, Regularization: L2 (α=0.0001)")
+    print(f"  Early stopping: Enabled (patience=10)")
     
-    # Train neural network with monitoring
+    # Train neural network
     print(f"\nTraining neural network...")
-    print(f"  [This may take 30-60 seconds depending on data size]")
+    print(f"  [Training in progress - may take 30-60 seconds...]")
     
     mlp.fit(X_train_scaled, y_train)
     
-    # Training summary
+    # Training results
     print(f"\nTraining Results:")
-    print(f"  Iterations completed: {mlp.n_iter_}")
-    print(f"  Final training loss: {mlp.loss_:.6f}")
-    print(f"  Convergence: {'✓ Converged' if mlp.n_iter_ < 1000 else '⚠ Max iterations reached'}")
-    
-    if hasattr(mlp, 'validation_scores_') and mlp.validation_scores_:
-        best_val_score = max(mlp.validation_scores_)
-        print(f"  Best validation score: {best_val_score:.6f}")
-        print(f"  Early stopping: {'✓ Activated' if len(mlp.validation_scores_) < 1000 else '✗ Not triggered'}")
+    print(f"  Iterations: {mlp.n_iter_}")
+    print(f"  Final loss: {mlp.loss_:.6f}")
+    print(f"  Convergence: {'✓ Converged' if mlp.n_iter_ < 1000 else '⚠ Max iterations'}")
     
     # Generate predictions
-    print(f"\nGenerating neural network predictions...")
+    print(f"Generating predictions...")
     y_pred = mlp.predict(X_test_scaled)
     
-    # Calculate comprehensive performance metrics
+    # Calculate performance metrics
     r2 = r2_score(y_test, y_pred)
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     mae = np.mean(np.abs(y_test - y_pred))
@@ -531,20 +334,13 @@ def train_and_evaluate_mlp(X_train, X_test, y_train, y_test, test_data):
     print(f"  MAE: {mae:.3f}")
     
     # Performance assessment
-    if r2 > 0.8:
-        performance_grade = "EXCELLENT"
-    elif r2 > 0.6:
-        performance_grade = "GOOD"
-    elif r2 > 0.4:
-        performance_grade = "MODERATE"
-    else:
-        performance_grade = "POOR"
+    performance = ("EXCELLENT" if r2 > 0.8 else "GOOD" if r2 > 0.6 else 
+                  "MODERATE" if r2 > 0.4 else "POOR")
+    print(f"  Performance Grade: {performance}")
     
-    print(f"  Performance Grade: {performance_grade}")
-    
-    # Station-specific neural network validation
+    # Station-specific validation
     station_metrics = {}
-    print(f"\nSpatial Validation (Station-Specific Performance):")
+    print(f"\nStation-Specific Performance:")
     
     for station in test_data['station'].unique():
         station_mask = test_data['station'] == station
@@ -557,75 +353,34 @@ def train_and_evaluate_mlp(X_train, X_test, y_train, y_test, test_data):
             station_mae = np.mean(np.abs(station_y_test - station_y_pred))
             
             station_metrics[station] = {
-                'R2': station_r2,
-                'RMSE': station_rmse,
-                'MAE': station_mae,
+                'R2': station_r2, 'RMSE': station_rmse, 'MAE': station_mae,
                 'n_samples': len(station_y_test)
             }
             
-            # Station-specific performance assessment
-            station_grade = ("Excellent" if station_r2 > 0.7 else 
-                           "Good" if station_r2 > 0.5 else 
-                           "Moderate" if station_r2 > 0.3 else "Poor")
-            
-            print(f"  {station} ({len(station_y_test)} samples):")
-            print(f"    R² = {station_r2:.3f} ({station_grade})")
-            print(f"    RMSE = {station_rmse:.3f}")
-            print(f"    MAE = {station_mae:.3f}")
-        else:
-            print(f"  {station}: Insufficient data for evaluation")
+            grade = ("Excellent" if station_r2 > 0.7 else "Good" if station_r2 > 0.5 else "Moderate")
+            print(f"  {station}: R² = {station_r2:.3f} ({grade}), n = {len(station_y_test)}")
     
     # Placeholder for feature importance (calculated separately)
     feature_importance = {}
     normalized_importance = {}
     
-    print(f"\nNeural network training completed successfully!")
-    
     return mlp, scaler, y_pred, r2, rmse, station_metrics, feature_importance, normalized_importance
-
 
 def calculate_feature_importance(model, X_test_scaled, y_test, feature_names):
     """
     Calculate neural network feature importance using permutation importance.
     
-    Neural networks lack the direct interpretability of linear models, making
-    feature importance analysis more complex. Permutation importance provides
-    a model-agnostic approach to understand which features contribute most
-    to neural network predictions.
-    
-    Permutation Importance Methodology:
-    1. Establish baseline model performance on test set
-    2. For each feature, randomly permute its values
-    3. Measure performance degradation due to permutation
-    4. Higher degradation indicates higher feature importance
-    5. Repeat with multiple random permutations for robustness
-    
-    Advantages for Neural Networks:
-    - Model-agnostic: Works with any trained neural network
-    - Captures non-linear feature effects and interactions
-    - Provides statistical confidence through repeated permutations
-    - Comparable across different model types
-    
-    Limitations:
-    - Computationally expensive (requires multiple model evaluations)
-    - May underestimate correlated feature importance
-    - Reflects trained model behavior, not true causal relationships
+    Provides model-agnostic approach to understand feature contributions
+    through systematic feature permutation and performance degradation analysis.
     
     Parameters:
-    -----------
-    model : MLPRegressor
-        Trained neural network model
-    X_test_scaled : array-like
-        Standardized test features
-    y_test : array-like
-        Test targets for performance measurement
-    feature_names : list
-        Names of features for importance labeling
+    model (MLPRegressor): Trained neural network
+    X_test_scaled (array): Standardized test features
+    y_test (array): Test targets
+    feature_names (list): Feature names for labeling
     
     Returns:
-    --------
-    tuple
-        (feature_importance, normalized_importance) - Absolute and relative importance
+    tuple: (feature_importance, normalized_importance)
     """
     print("\n" + "="*50)
     print("NEURAL NETWORK FEATURE IMPORTANCE ANALYSIS")
@@ -634,42 +389,37 @@ def calculate_feature_importance(model, X_test_scaled, y_test, feature_names):
     print("Calculating permutation importance...")
     print("  Method: Permutation-based feature importance")
     print("  Repetitions: 10 (for statistical robustness)")
-    print("  Metric: R² degradation")
-    print("  [This may take 30-60 seconds...]")
+    print("  [Processing - may take 30-60 seconds...]")
     
-    # Calculate permutation importance with multiple repetitions
+    # Calculate permutation importance
     perm_importance = permutation_importance(
         model, X_test_scaled, y_test, 
-        n_repeats=10,           # Multiple repetitions for robustness
-        random_state=42,        # Reproducible results
-        scoring='r2'            # R² scoring for regression
+        n_repeats=10, random_state=42, scoring='r2'
     )
     
     # Extract importance statistics
     importance_means = perm_importance.importances_mean
     importance_stds = perm_importance.importances_std
     
-    # Create feature importance dictionary
+    # Create dictionaries
     feature_importance = dict(zip(feature_names, importance_means))
     importance_uncertainties = dict(zip(feature_names, importance_stds))
     
-    # Calculate normalized importance (relative contributions)
-    total_importance = np.sum(np.maximum(importance_means, 0))  # Only positive contributions
+    # Calculate normalized importance
+    total_importance = np.sum(np.maximum(importance_means, 0))
     if total_importance > 0:
         normalized_importance = {
             feature: max(importance, 0) / total_importance 
             for feature, importance in feature_importance.items()
         }
     else:
-        # Fallback if all importances are negative/zero
         normalized_importance = {feature: 1.0/len(feature_names) for feature in feature_names}
     
-    # Feature importance analysis and interpretation
+    # Display results
     print(f"\nPermutation Importance Results:")
-    print(f"{'Feature':<25} {'Importance':<12} {'Std':<8} {'Normalized':<12} {'Interpretation'}")
-    print(f"{'-'*80}")
+    print(f"{'Feature':<25} {'Importance':<12} {'Std':<8} {'Normalized':<12}")
+    print(f"{'-'*65}")
     
-    # Sort features by importance for clear presentation
     sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
     
     for feature, importance in sorted_features:
@@ -677,16 +427,8 @@ def calculate_feature_importance(model, X_test_scaled, y_test, feature_names):
         normalized = normalized_importance[feature]
         
         # Interpret importance level
-        if normalized > 0.4:
-            interp = "DOMINANT"
-        elif normalized > 0.25:
-            interp = "HIGH"
-        elif normalized > 0.15:
-            interp = "MODERATE"
-        elif normalized > 0.05:
-            interp = "LOW"
-        else:
-            interp = "MINIMAL"
+        interp = ("DOMINANT" if normalized > 0.4 else "HIGH" if normalized > 0.25 else 
+                 "MODERATE" if normalized > 0.15 else "LOW" if normalized > 0.05 else "MINIMAL")
         
         print(f"{feature:<25} {importance:>8.3f}    {std:>6.3f}   {normalized:>8.1%}     {interp}")
     
@@ -695,78 +437,36 @@ def calculate_feature_importance(model, X_test_scaled, y_test, feature_names):
     significant_features = []
     for feature, importance in feature_importance.items():
         std = importance_uncertainties[feature]
-        # Feature is significant if importance > 2 * standard deviation
         if importance > 2 * std:
             significant_features.append(feature)
-            print(f"  ✓ {feature}: Statistically significant (p < 0.05 equivalent)")
+            print(f"  ✓ {feature}: Statistically significant")
         else:
             print(f"  ~ {feature}: Not statistically significant")
     
     print(f"\nFeature Importance Summary:")
-    print(f"  Statistically significant features: {len(significant_features)}/{len(feature_names)}")
-    print(f"  Most important feature: {sorted_features[0][0]} ({normalized_importance[sorted_features[0][0]]:.1%})")
-    
-    # Compare with expected glaciological relationships
-    print(f"\nGlaciological Interpretation:")
-    for feature in feature_names:
-        importance = normalized_importance[feature]
-        if feature == 'TC':
-            expected = "High (temperature drives melting/freezing)"
-            status = "✓ Expected" if importance > 0.2 else "⚠ Lower than expected"
-        elif feature == 'snowfall_probability':
-            expected = "High (snowfall increases albedo)"
-            status = "✓ Expected" if importance > 0.2 else "⚠ Lower than expected"
-        elif feature == 'pdd':
-            expected = "Moderate (cumulative thermal effects)"
-            status = "✓ Expected" if 0.1 < importance < 0.4 else "⚠ Unexpected level"
-        else:  # day_of_year
-            expected = "Low-Moderate (seasonal patterns)"
-            status = "✓ Expected" if importance < 0.3 else "⚠ Higher than expected"
-        
-        print(f"  {feature}: {importance:.1%} importance")
-        print(f"    Expected: {expected}")
-        print(f"    Status: {status}")
+    print(f"  Significant features: {len(significant_features)}/{len(feature_names)}")
+    print(f"  Most important: {sorted_features[0][0]} ({normalized_importance[sorted_features[0][0]]:.1%})")
     
     return feature_importance, normalized_importance
-
 
 def plot_predicted_vs_measured(y_test, y_pred, test_data):
     """
     Create diagnostic scatter plot for neural network albedo predictions.
     
-    This visualization provides comprehensive assessment of neural network
-    performance, highlighting both overall accuracy and potential systematic
-    biases or non-linear effects that the network has learned.
-    
-    Plot Features:
-    - Station-wise color coding for spatial validation
-    - Perfect prediction reference line
-    - Performance metrics annotation
-    - Enhanced styling for publication quality
-    - Neural network specific annotations
-    
-    Diagnostic Interpretation:
-    - Tight clustering around 1:1 line: Excellent neural network performance
-    - Systematic deviations: Model bias or remaining non-linearities
-    - Station-specific patterns: Spatial generalization assessment
-    - Outliers: Potential data quality issues or extreme conditions
+    Features comprehensive performance assessment with station-wise analysis,
+    perfect prediction reference, and confidence bands.
     
     Parameters:
-    -----------
-    y_test : pd.Series or array-like
-        Observed albedo values (ground truth)
-    y_pred : array-like
-        Neural network predicted albedo values
-    test_data : pd.DataFrame
-        Original dataset with station identifiers
+    y_test (array): Observed albedo values
+    y_pred (array): Neural network predictions
+    test_data (pd.DataFrame): Test dataset with station info
     """
-    plt.figure(figsize=(14, 10))
+    plt.figure(figsize=(12, 9))
     
-    # Professional color palette and markers for stations
+    # Station-wise plotting with enhanced styling
     colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D', '#6A994E', '#8E44AD']
     markers = ['o', 's', '^', 'D', 'v', 'P']
     
-    # Create main scatter plot with station differentiation
     for i, station in enumerate(test_data['station'].unique()):
         station_mask = test_data['station'] == station
         color = colors[i % len(colors)]
@@ -784,44 +484,39 @@ def plot_predicted_vs_measured(y_test, y_pred, test_data):
     plt.plot(line_range, line_range, 'k--', alpha=0.8, linewidth=3, 
              label='Perfect Prediction (1:1)', zorder=1)
     
-    # Calculate comprehensive performance metrics
+    # Performance metrics
     r2_overall = r2_score(y_test, y_pred)
     rmse_overall = np.sqrt(mean_squared_error(y_test, y_pred))
     mae_overall = np.mean(np.abs(y_test - y_pred))
     
-    # Enhanced performance annotation
     textstr = (f'Multi-Layer Perceptron Neural Network\n'
                f'R² = {r2_overall:.3f}\n'
                f'RMSE = {rmse_overall:.3f}\n'
                f'MAE = {mae_overall:.3f}\n'
                f'Samples = {len(y_test)}')
     
-    props = dict(boxstyle='round,pad=0.5', facecolor='lightgreen', alpha=0.8, edgecolor='darkgreen')
+    props = dict(boxstyle='round,pad=0.5', facecolor='lightgreen', alpha=0.8)
     plt.text(0.05, 0.95, textstr, transform=plt.gca().transAxes, 
              fontsize=12, fontweight='bold', verticalalignment='top', bbox=props)
     
-    # Add residual statistics
+    # Add confidence bands
     residuals = y_test - y_pred
     residual_std = np.std(residuals)
     
-    # Add confidence bands (±1 and ±2 standard deviations)
     plt.fill_between(line_range, line_range - residual_std, line_range + residual_std,
                      alpha=0.1, color='gray', label='±1σ residual band')
-    plt.fill_between(line_range, line_range - 2*residual_std, line_range + 2*residual_std,
-                     alpha=0.05, color='gray', label='±2σ residual band')
     
-    # Enhanced formatting
-    plt.xlabel('Measured Albedo', fontweight='bold', fontsize=16)
-    plt.ylabel('Neural Network Predicted Albedo', fontweight='bold', fontsize=16)
-    plt.title('Albedo Prediction Validation: Multi-Layer Perceptron Neural Network\n'
-              'Non-Linear Machine Learning Approach (2011 Test Data)', 
-              fontweight='bold', fontsize=18)
+    # Formatting
+    plt.xlabel('Measured Albedo', fontweight='bold', fontsize=14)
+    plt.ylabel('Neural Network Predicted Albedo', fontweight='bold', fontsize=14)
+    plt.title('Neural Network Albedo Prediction Validation\n'
+              'Multi-Layer Perceptron Non-Linear Approach (2011 Test Data)', 
+              fontweight='bold', fontsize=16)
     
-    plt.legend(loc='lower right', framealpha=0.9, fontsize=12)
+    plt.legend(loc='lower right', framealpha=0.9)
     plt.grid(True, alpha=0.3)
-    
-    # Set equal aspect ratio and appropriate limits
     plt.axis('equal')
+    
     margin = (max_val - min_val) * 0.05
     plt.xlim(min_val - margin, max_val + margin)
     plt.ylim(min_val - margin, max_val + margin)
@@ -829,85 +524,69 @@ def plot_predicted_vs_measured(y_test, y_pred, test_data):
     plt.tight_layout()
     plt.show()
 
-
 def plot_feature_importance(feature_importance):
     """
-    Visualize neural network feature importance with uncertainty estimates.
+    Visualize neural network feature importance with process-based color coding.
     
-    This plot shows the relative importance of different meteorological
-    variables as learned by the neural network, providing insights into
-    which physical processes the network considers most relevant for
-    albedo prediction.
-    
-    Enhanced Features:
-    - Color-coded bars by process type (thermal, precipitation, seasonal)
-    - Error bars showing statistical uncertainty
-    - Process-based interpretation annotations
-    - Publication-ready styling
+    Shows relative importance of meteorological variables as learned by
+    the neural network with enhanced styling for publication.
     
     Parameters:
-    -----------
-    feature_importance : dict
-        Permutation importance values for each feature
+    feature_importance (dict): Permutation importance values
     """
     plt.figure(figsize=(12, 8))
     
-    # Prepare data for plotting
+    # Prepare plotting data
     importance_df = pd.DataFrame({
         'Feature': list(feature_importance.keys()),
         'Importance': list(feature_importance.values())
     })
     
-    # Sort by importance for better visualization
+    # Sort by importance
     importance_df = importance_df.sort_values('Importance', ascending=True)
     
-    # Define process-based color scheme
+    # Process-based color scheme
     colors = []
-    process_labels = []
     for feature in importance_df['Feature']:
         if feature == 'TC':
             colors.append('#FF6B35')  # Orange-red for temperature
-            process_labels.append('Temperature')
         elif feature == 'pdd':
             colors.append('#FF8C42')  # Light orange for thermal history
-            process_labels.append('Thermal History')
         elif feature == 'snowfall_probability':
             colors.append('#004E89')  # Blue for precipitation
-            process_labels.append('Precipitation')
         else:  # day_of_year
             colors.append('#7209B7')  # Purple for seasonal
-            process_labels.append('Seasonal')
     
     # Create horizontal bar plot
     bars = plt.barh(importance_df['Feature'], importance_df['Importance'], 
                    color=colors, alpha=0.8, edgecolor='white', linewidth=2)
     
-    # Add importance values as annotations
+    # Add importance annotations
     for i, (feature, importance) in enumerate(zip(importance_df['Feature'], importance_df['Importance'])):
         plt.text(importance + 0.001, i, f'{importance:.3f}', 
                 ha='left', va='center', fontweight='bold', fontsize=11)
     
-    # Enhanced formatting
-    plt.xlabel('Permutation Importance\n(R² degradation when feature is randomized)', 
-               fontweight='bold', fontsize=14)
-    plt.ylabel('Meteorological Features', fontweight='bold', fontsize=14)
+    # Formatting
+    plt.xlabel('Permutation Importance\n(R² degradation when feature randomized)', 
+               fontweight='bold', fontsize=12)
+    plt.ylabel('Meteorological Features', fontweight='bold', fontsize=12)
     plt.title('Neural Network Feature Importance Analysis\n'
-              'Multi-Layer Perceptron: Process Contributions to Albedo Prediction', 
-              fontweight='bold', fontsize=16)
+              'Multi-Layer Perceptron: Process Contributions', 
+              fontweight='bold', fontsize=14)
     
     plt.grid(True, alpha=0.3, axis='x')
     
-    # Create custom legend for process types
+    # Custom legend for process types
     from matplotlib.patches import Patch
     legend_elements = [
-        Patch(facecolor='#FF6B35', alpha=0.8, label='Temperature Processes'),
+        Patch(facecolor='#FF6B35', alpha=0.8, label='Temperature'),
         Patch(facecolor='#FF8C42', alpha=0.8, label='Thermal History'),
-        Patch(facecolor='#004E89', alpha=0.8, label='Precipitation Processes'),
-        Patch(facecolor='#7209B7', alpha=0.8, label='Seasonal Patterns')
+        Patch(facecolor='#004E89', alpha=0.8, label='Precipitation'),
+        Patch(facecolor='#7209B7', alpha=0.8, label='Seasonal')
     ]
-    plt.legend(handles=legend_elements, loc='lower right', fontsize=12)
+    plt.legend(handles=legend_elements, loc='lower right')
     
-    # Add interpretation text
+    # Add interpretation
     max_importance = max(importance_df['Importance'])
     dominant_feature = importance_df.loc[importance_df['Importance'].idxmax(), 'Feature']
     
@@ -919,34 +598,20 @@ def plot_feature_importance(feature_importance):
     plt.tight_layout()
     plt.show()
 
-
 def plot_station_time_series(station_name, test_data, y_test, y_pred):
     """
-    Create detailed temporal validation plot for neural network predictions.
+    Create temporal validation plot for neural network predictions.
     
-    This time series visualization shows how well the neural network
-    captures complex temporal patterns in albedo evolution throughout
-    the ablation season at individual glacier monitoring sites.
-    
-    Enhanced Features:
-    - High-resolution temporal plotting
-    - Prediction confidence visualization
-    - Performance metrics annotation
-    - Monthly temporal reference markers
-    - Neural network specific interpretation
+    Shows measured vs. predicted albedo evolution with performance metrics,
+    prediction uncertainty bands, and monthly temporal reference.
     
     Parameters:
-    -----------
-    station_name : str
-        Station identifier for analysis
-    test_data : pd.DataFrame
-        Original temporal dataset
-    y_test : pd.Series
-        Observed albedo values
-    y_pred : array-like
-        Neural network predictions
+    station_name (str): Station identifier
+    test_data (pd.DataFrame): Original temporal dataset
+    y_test (array): Observed albedo values
+    y_pred (array): Neural network predictions
     """
-    # Extract and validate station data
+    # Extract station data
     station_mask = test_data['station'] == station_name
     
     if not station_mask.any():
@@ -957,26 +622,25 @@ def plot_station_time_series(station_name, test_data, y_test, y_pred):
     station_measured = y_test[station_mask]
     station_predicted = y_pred[station_mask]
     
-    # Sort by temporal order for proper time series display
+    # Sort by temporal order
     sort_indices = np.argsort(station_data['day_of_year'].values)
     days_sorted = station_data['day_of_year'].values[sort_indices]
     measured_sorted = station_measured.values[sort_indices]
     predicted_sorted = station_predicted[sort_indices]
     
-    # Calculate station-specific neural network performance
+    # Calculate performance metrics
     station_r2 = r2_score(station_measured, station_predicted)
     station_rmse = np.sqrt(mean_squared_error(station_measured, station_predicted))
     station_mae = np.mean(np.abs(station_measured - station_predicted))
     
-    # Create enhanced time series plot
-    plt.figure(figsize=(16, 10))
+    # Create time series plot
+    plt.figure(figsize=(15, 9))
     
-    # Plot measured albedo with enhanced styling
+    # Plot measured and predicted albedo
     plt.plot(days_sorted, measured_sorted, 'b-', linewidth=3.5, 
              label='Measured Albedo', alpha=0.9, marker='o', markersize=6,
              markerfacecolor='lightblue', markeredgecolor='blue', markeredgewidth=2)
     
-    # Plot neural network predictions
     plt.plot(days_sorted, predicted_sorted, 'r--', linewidth=3, 
              label='Neural Network Prediction', alpha=0.9, marker='s', markersize=5,
              markerfacecolor='lightcoral', markeredgecolor='darkred', markeredgewidth=1.5)
@@ -985,70 +649,56 @@ def plot_station_time_series(station_name, test_data, y_test, y_pred):
     plt.fill_between(days_sorted, measured_sorted, predicted_sorted, 
                      alpha=0.25, color='gray', label='Prediction Error')
     
-    # Calculate and show prediction confidence bands
+    # Add uncertainty bands
     residuals = measured_sorted - predicted_sorted
     residual_std = np.std(residuals)
     
     plt.fill_between(days_sorted, predicted_sorted - residual_std, predicted_sorted + residual_std,
                      alpha=0.15, color='red', label='Neural Network Uncertainty (±1σ)')
     
-    # Enhanced performance metrics annotation
+    # Performance annotation
     textstr = (f'Neural Network Performance: {station_name.upper()}\n'
                f'Architecture: MLP (100-50 neurons)\n'
                f'R² = {station_r2:.3f}\n'
                f'RMSE = {station_rmse:.3f}\n'
                f'MAE = {station_mae:.3f}\n'
-               f'Samples = {len(station_measured)}\n'
-               f'Residual σ = {residual_std:.3f}')
+               f'Samples = {len(station_measured)}')
     
-    props = dict(boxstyle='round,pad=0.5', facecolor='lightcyan', alpha=0.9, edgecolor='teal')
+    props = dict(boxstyle='round,pad=0.5', facecolor='lightcyan', alpha=0.9)
     plt.text(0.02, 0.98, textstr, transform=plt.gca().transAxes, fontsize=12,
              verticalalignment='top', bbox=props, fontweight='bold')
     
-    # Enhanced formatting
-    plt.xlabel('Day of Year', fontweight='bold', fontsize=16)
-    plt.ylabel('Surface Albedo', fontweight='bold', fontsize=16)
-    plt.title(f'Neural Network Albedo Prediction: {station_name.upper()} Station\n'
-              f'Multi-Layer Perceptron Validation (2011 Extended Season)', 
-              fontweight='bold', fontsize=18)
+    # Formatting
+    plt.xlabel('Day of Year', fontweight='bold', fontsize=14)
+    plt.ylabel('Surface Albedo', fontweight='bold', fontsize=14)
+    plt.title(f'Neural Network Albedo Prediction: {station_name.upper()}\n'
+              f'Multi-Layer Perceptron Validation (2011)', 
+              fontweight='bold', fontsize=16)
     
-    plt.legend(loc='upper right', framealpha=0.9, fontsize=13)
+    plt.legend(loc='upper right', framealpha=0.9)
     plt.grid(True, alpha=0.3)
-    
-    # Set appropriate y-axis limits
     plt.ylim(0, 1)
     
-    # Add detailed monthly reference markers
-    month_days = [98, 121, 152, 182, 213, 244]  # Mid-month approximations
-    month_labels = ['Apr\n(Spring)', 'May\n(Early Summer)', 'Jun\n(Summer)', 
-                   'Jul\n(Peak Summer)', 'Aug\n(Late Summer)', 'Sep\n(Early Fall)']
+    # Add monthly reference
+    month_days = [98, 121, 152, 182, 213, 244]
+    month_labels = ['Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep']
     
-    # Filter to actual data range
-    data_range = (min(days_sorted), max(days_sorted))
     valid_months = [(day, label) for day, label in zip(month_days, month_labels) 
-                   if data_range[0] <= day <= data_range[1]]
+                   if min(days_sorted) <= day <= max(days_sorted)]
     
     if valid_months:
         valid_days, valid_labels = zip(*valid_months)
-        plt.xticks(valid_days, valid_labels, fontsize=11)
+        plt.xticks(valid_days, valid_labels)
         
-        # Add subtle month separators
+        # Add month separators
         for day in valid_days:
-            plt.axvline(x=day, color='gray', linestyle=':', alpha=0.6, linewidth=1)
+            plt.axvline(x=day, color='gray', linestyle=':', alpha=0.6)
     
-    # Add model performance assessment
-    if station_r2 > 0.8:
-        perf_text = "EXCELLENT"
-        perf_color = 'green'
-    elif station_r2 > 0.6:
-        perf_text = "GOOD"
-        perf_color = 'orange'
-    elif station_r2 > 0.4:
-        perf_text = "MODERATE"
-        perf_color = 'yellow'
-    else:
-        perf_text = "POOR"
-        perf_color = 'red'
+    # Performance assessment indicator
+    perf_color = ('green' if station_r2 > 0.8 else 'orange' if station_r2 > 0.6 else 
+                 'yellow' if station_r2 > 0.4 else 'red')
+    perf_text = ('EXCELLENT' if station_r2 > 0.8 else 'GOOD' if station_r2 > 0.6 else 
+                'MODERATE' if station_r2 > 0.4 else 'POOR')
     
     plt.text(0.98, 0.02, f'Performance: {perf_text}', transform=plt.gca().transAxes,
              fontsize=14, fontweight='bold', ha='right', va='bottom',
@@ -1057,451 +707,153 @@ def plot_station_time_series(station_name, test_data, y_test, y_pred):
     plt.tight_layout()
     plt.show()
 
-
-def optimize_mlp_hyperparameters(X_train, y_train):
-    """
-    Perform systematic hyperparameter optimization for MLP neural network.
-    
-    This function implements grid search cross-validation to find optimal
-    neural network architecture and training parameters for glacier albedo
-    prediction. The optimization balances model complexity with generalization
-    performance to avoid overfitting while maximizing predictive accuracy.
-    
-    Hyperparameter Search Space:
-    - Hidden layer architectures: From simple (50 neurons) to complex (100-100)
-    - Activation functions: ReLU vs. Tanh for different non-linearity types
-    - Regularization strength: Range of L2 penalties for overfitting control
-    - Learning rates: Adaptive optimization for convergence speed
-    
-    Cross-Validation Strategy:
-    - 5-fold cross-validation for robust performance estimation
-    - Negative MSE scoring for regression optimization
-    - Parallel processing for computational efficiency
-    - Conservative parameter ranges for glaciological applications
-    
-    Parameters:
-    -----------
-    X_train : pd.DataFrame
-        Training feature matrix
-    y_train : pd.Series
-        Training albedo targets
-    
-    Returns:
-    --------
-    tuple
-        (best_params, fitted_scaler) - Optimal hyperparameters and data scaler
-    """
-    print("\n" + "="*60)
-    print("NEURAL NETWORK HYPERPARAMETER OPTIMIZATION")
-    print("="*60)
-    
-    # Feature standardization for optimization
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    
-    # Define comprehensive parameter grid
-    # Parameters chosen for glaciological regression stability
-    param_grid = {
-        'hidden_layer_sizes': [
-            (50,),           # Simple: Single layer
-            (100,),          # Medium: Single larger layer
-            (50, 50),        # Deep: Two equal layers
-            (100, 50),       # Funnel: Decreasing layer sizes
-            (100, 100),      # Wide: Two large layers
-            (150, 75, 25)    # Deep funnel: Three layers
-        ],
-        'activation': [
-            'relu',          # Standard choice for regression
-            'tanh'           # Alternative for bounded outputs
-        ],
-        'alpha': [
-            0.0001,          # Light regularization
-            0.001,           # Medium regularization
-            0.01             # Strong regularization
-        ],
-        'learning_rate_init': [
-            0.001,           # Conservative learning rate
-            0.01             # More aggressive learning rate
-        ]
-    }
-    
-    print(f"Hyperparameter Search Configuration:")
-    print(f"  Architecture options: {len(param_grid['hidden_layer_sizes'])}")
-    print(f"  Activation functions: {param_grid['activation']}")
-    print(f"  Regularization values: {param_grid['alpha']}")
-    print(f"  Learning rates: {param_grid['learning_rate_init']}")
-    print(f"  Total combinations: {np.prod([len(v) for v in param_grid.values()])}")
-    
-    # Configure grid search with cross-validation
-    grid_search = GridSearchCV(
-        estimator=MLPRegressor(
-            max_iter=1000,              # Sufficient iterations
-            early_stopping=True,        # Prevent overfitting
-            validation_fraction=0.1,    # Validation for early stopping
-            random_state=42             # Reproducible results
-        ),
-        param_grid=param_grid,
-        cv=5,                          # 5-fold cross-validation
-        scoring='neg_mean_squared_error',  # Regression optimization metric
-        n_jobs=-1,                     # Use all available CPU cores
-        verbose=1                      # Progress monitoring
-    )
-    
-    print(f"\nStarting grid search with 5-fold cross-validation...")
-    print(f"  [This may take several minutes depending on dataset size]")
-    print(f"  [Progress will be displayed during optimization]")
-    
-    # Perform hyperparameter optimization
-    grid_search.fit(X_train_scaled, y_train)
-    
-    # Extract optimization results
-    best_params = grid_search.best_params_
-    best_score = -grid_search.best_score_  # Convert negative MSE back to positive
-    
-    print(f"\nHyperparameter Optimization Results:")
-    print(f"{'='*50}")
-    print(f"  Best cross-validation MSE: {best_score:.6f}")
-    print(f"  Best cross-validation RMSE: {np.sqrt(best_score):.3f}")
-    
-    print(f"\nOptimal Hyperparameters:")
-    for param, value in best_params.items():
-        if param == 'hidden_layer_sizes':
-            layer_description = f"{len(value)} layers: {' → '.join(map(str, value))}"
-            print(f"  {param}: {value} ({layer_description})")
-        else:
-            print(f"  {param}: {value}")
-    
-    # Analyze parameter importance
-    print(f"\nHyperparameter Analysis:")
-    
-    # Architecture analysis
-    arch = best_params['hidden_layer_sizes']
-    total_neurons = sum(arch)
-    complexity = "Simple" if total_neurons < 100 else "Medium" if total_neurons < 200 else "Complex"
-    print(f"  Architecture complexity: {complexity} ({total_neurons} total neurons)")
-    
-    # Regularization analysis
-    alpha = best_params['alpha']
-    reg_level = "Light" if alpha < 0.001 else "Medium" if alpha < 0.01 else "Strong"
-    print(f"  Regularization level: {reg_level} (α = {alpha})")
-    
-    # Learning rate analysis
-    lr = best_params['learning_rate_init']
-    lr_level = "Conservative" if lr <= 0.001 else "Moderate" if lr <= 0.01 else "Aggressive"
-    print(f"  Learning rate: {lr_level} ({lr})")
-    
-    # Provide recommendations
-    print(f"\nOptimization Recommendations:")
-    if total_neurons < 50:
-        print(f"  • Simple architecture selected - consider linear models for comparison")
-    elif total_neurons > 200:
-        print(f"  • Complex architecture selected - ensure sufficient training data")
-    else:
-        print(f"  • Balanced architecture selected - good for glaciological applications")
-    
-    if alpha >= 0.01:
-        print(f"  • Strong regularization needed - suggests potential overfitting tendency")
-    else:
-        print(f"  • Light regularization sufficient - model generalizes well")
-    
-    return best_params, scaler
-
-
 def main():
     """
     Main execution function for neural network albedo prediction analysis.
     
-    This comprehensive workflow implements and validates a deep learning approach
-    to glacier albedo prediction, providing advanced non-linear modeling capabilities
-    that complement traditional linear regression methods. The analysis establishes
-    whether complex neural networks offer significant improvements over simpler
-    linear approaches for glaciological applications.
+    Tests hypothesis that neural networks can capture non-linear relationships
+    between meteorological variables and glacier albedo, providing superior
+    predictive performance compared to linear regression baselines.
     
-    Research Questions Addressed:
-    1. Can neural networks capture non-linear albedo-meteorology relationships?
-    2. What is the optimal neural network architecture for glacier applications?
-    3. Which meteorological features are most important in neural network models?
-    4. How does neural network performance compare to linear regression baselines?
-    5. Do neural networks improve spatial generalization across glacier sites?
-    
-    Methodology:
-    - Multi-Layer Perceptron with systematic hyperparameter optimization
-    - Temporal cross-validation with independent year testing
-    - Permutation-based feature importance for interpretability
-    - Comprehensive spatial and temporal validation
-    - Direct comparison framework with linear model benchmarks
-    
-    Expected Outcomes:
-    - If non-linear relationships exist: neural networks show significant improvement
-    - If relationships are primarily linear: marginal improvement over linear models
-    - Feature importance ranking provides insights into physical process dominance
-    - Spatial consistency indicates robust non-linear pattern learning
+    Workflow:
+    1. Load datasets with neural network validation
+    2. Train MLP with comprehensive architecture
+    3. Evaluate non-linear learning capability
+    4. Calculate permutation-based feature importance
+    5. Generate publication-ready visualizations
+    6. Assess model complexity vs. performance trade-offs
     """
-    print("="*80)
-    print("SVALBARD GLACIER ALBEDO PREDICTION: NEURAL NETWORK APPROACH")
+    print("="*70)
+    print("NEURAL NETWORK GLACIER ALBEDO PREDICTION")
     print("Multi-Layer Perceptron for Non-Linear Relationship Discovery")
-    print("="*80)
-    print(f"Analysis initiated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*70)
+    print(f"Analysis started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # ==============================================
-    # Research Hypothesis and Neural Network Rationale
-    # ==============================================
-    
+    # Research hypothesis
     print(f"\nRESEARCH HYPOTHESIS:")
-    print(f"  Glacier albedo dynamics involve complex, non-linear relationships")
-    print(f"  between meteorological variables that cannot be captured by linear")
-    print(f"  regression models. Neural networks can discover these non-linear")
-    print(f"  patterns and provide superior predictive performance for Arctic")
-    print(f"  glacier surface albedo forecasting.")
+    print(f"  Glacier albedo involves complex, non-linear relationships that")
+    print(f"  cannot be captured by linear models. Neural networks can discover")
+    print(f"  these patterns and provide superior predictive performance.")
     
     print(f"\nNEURAL NETWORK ADVANTAGES:")
     print(f"  • Non-linear relationship detection (thresholds, interactions)")
     print(f"  • Automatic feature engineering through hidden layers")
     print(f"  • Robust handling of complex meteorological patterns")
-    print(f"  • Potential for improved prediction accuracy")
     print(f"  • Model-agnostic feature importance assessment")
     
-    # Dataset configuration for neural network training
-    # Note: Currently configured for single station analysis
+    # Dataset configuration
+    # Note: Currently single-station for focused analysis
     train_files = [
-        #"hans4_2010_processed_with_pdd.csv",     # Available for multi-station training
         "hans9_2010_processed_with_pdd.csv",      # Primary training data
-        #"werenskiold_2012_processed_with_pdd.csv", # Additional spatial coverage
-        # 2011 files reserved for independent testing:
-        #"hans4_2011_processed_with_pdd.csv",
-        #"hans9_2011_processed_with_pdd.csv",
-        #"werenskiold_2011_processed_with_pdd.csv"
+        # Additional stations available by uncommenting:
+        # "hans4_2010_processed_with_pdd.csv",
+        # "werenskiold_2012_processed_with_pdd.csv",
     ]
     
     test_files = [
-        #"hans4_2011_processed_with_pdd.csv",     # Available for multi-station testing
         "hans9_2011_processed_with_pdd.csv",      # Primary testing data
-        #"werenskiold_2011_processed_with_pdd.csv" # Additional spatial validation
+        # Additional stations available by uncommenting:
+        # "hans4_2011_processed_with_pdd.csv",
+        # "werenskiold_2011_processed_with_pdd.csv"
     ]
     
-    print(f"\nNEURAL NETWORK DATASET CONFIGURATION:")
-    print(f"  Current Setup: Single-station analysis (hans9)")
-    print(f"  Training: 2010 data for temporal independence")
-    print(f"  Testing: 2011 data for validation")
-    print(f"  Note: Additional stations can be enabled by uncommenting file paths")
+    print(f"\nDataset Configuration:")
+    print(f"  Current: Single-station analysis (hans9)")
+    print(f"  Training: 2010 | Testing: 2011 (temporal independence)")
+    print(f"  Note: Multi-station analysis available by uncommenting file paths")
     
-    print(f"\n  Training Files:")
-    for f in train_files:
-        station = f.split('_')[0]
-        year = f.split('_')[1]
-        print(f"    - {f} ({station.upper()} {year})")
-    
-    print(f"\n  Testing Files:")
-    for f in test_files:
-        station = f.split('_')[0]
-        year = f.split('_')[1]
-        print(f"    - {f} ({station.upper()} {year})")
-    
-    # ==============================================
-    # Neural Network Data Preparation
-    # ==============================================
-    
+    # Data preparation
     print(f"\n{'-'*60}")
     print("NEURAL NETWORK DATA PREPARATION")
     print(f"{'-'*60}")
     
-    # Load and prepare neural network datasets
     X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_data_clean = prepare_data(
         train_files, test_files
     )
     
-    # Validate neural network data requirements
-    if len(X_train_clean) == 0:
-        print("ERROR: No training data loaded. Check file paths and data availability.")
-        return
-    if len(X_test_clean) == 0:
-        print("ERROR: No testing data loaded. Check file paths and data availability.")
+    # Validate data availability
+    if len(X_train_clean) == 0 or len(X_test_clean) == 0:
+        print("ERROR: Insufficient data. Check file paths.")
         return
     
-    # Neural network data sufficiency check
     if len(X_train_clean) < 100:
-        print("WARNING: Very limited training data for neural networks.")
-        print("Consider combining multiple stations/years or using simpler models.")
+        print("WARNING: Limited training data for neural networks.")
     
-    # ==============================================
-    # Optional Hyperparameter Optimization
-    # ==============================================
-    
-    print(f"\n{'-'*60}")
-    print("NEURAL NETWORK OPTIMIZATION OPTIONS")
-    print(f"{'-'*60}")
-    
-    # Hyperparameter optimization (computationally intensive)
-    # Uncomment the following lines to enable optimization
-    optimize_hyperparams = False  # Set to True to enable optimization
-    
-    if optimize_hyperparams:
-        print("Performing hyperparameter optimization...")
-        print("  [This may take 5-10 minutes depending on dataset size]")
-        best_params, scaler = optimize_mlp_hyperparameters(X_train_clean, y_train_clean)
-        print(f"Optimization completed. Best parameters: {best_params}")
-    else:
-        print("Using default hyperparameters for faster execution.")
-        print("  To enable optimization, set optimize_hyperparams = True")
-        print("  Default architecture: (100, 50) hidden layers")
-        best_params = None
-    
-    # ==============================================
-    # Neural Network Training and Evaluation
-    # ==============================================
-    
-    print(f"\n{'-'*60}")
-    print("NEURAL NETWORK TRAINING AND EVALUATION")
-    print(f"{'-'*60}")
-    
-    # Train neural network with comprehensive evaluation
+    # Neural network training and evaluation
     mlp, scaler, y_pred, r2, rmse, station_metrics, _, _ = train_and_evaluate_mlp(
         X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_data_clean
     )
     
-    # ==============================================
-    # Feature Importance Analysis
-    # ==============================================
-    
+    # Feature importance analysis
     print(f"\n{'-'*60}")
-    print("NEURAL NETWORK INTERPRETABILITY ANALYSIS")
+    print("NEURAL NETWORK INTERPRETABILITY")
     print(f"{'-'*60}")
     
-    # Calculate permutation-based feature importance
     X_test_scaled = scaler.transform(X_test_clean)
     feature_importance, normalized_importance = calculate_feature_importance(
         mlp, X_test_scaled, y_test_clean, X_train_clean.columns
     )
     
-    # ==============================================
-    # Neural Network Performance Assessment
-    # ==============================================
-    
+    # Performance assessment
     print(f"\n{'-'*60}")
     print("NEURAL NETWORK PERFORMANCE ASSESSMENT")
     print(f"{'-'*60}")
     
-    # Comprehensive performance evaluation
-    print(f"Neural Network Performance Summary:")
-    print(f"  Architecture: Multi-Layer Perceptron")
-    print(f"  Hidden Layers: (100, 50) neurons")
-    print(f"  Training Algorithm: Adam optimizer with early stopping")
-    print(f"  Regularization: L2 (α = 0.0001)")
+    performance = ("EXCELLENT" if r2 > 0.8 else "GOOD" if r2 > 0.6 else 
+                  "MODERATE" if r2 > 0.4 else "POOR")
     
-    print(f"\nOverall Performance Metrics:")
+    print(f"Overall Performance:")
     print(f"  R² Score: {r2:.3f}")
     print(f"  RMSE: {rmse:.3f}")
+    print(f"  Performance Grade: {performance}")
     
-    # Performance classification
-    if r2 > 0.8:
-        performance_class = "EXCELLENT"
-        recommendation = "Neural network shows outstanding predictive capability"
-    elif r2 > 0.6:
-        performance_class = "GOOD"
-        recommendation = "Neural network provides solid predictive performance"
-    elif r2 > 0.4:
-        performance_class = "MODERATE"
-        recommendation = "Neural network shows potential but may need optimization"
+    if r2 > 0.7:
+        print(f"  → Neural network demonstrates strong non-linear learning")
+    elif r2 > 0.5:
+        print(f"  → Neural network shows meaningful predictive capability")
     else:
-        performance_class = "POOR"
-        recommendation = "Consider simpler models or additional data collection"
+        print(f"  → Linear models may be sufficient for this application")
     
-    print(f"  Performance Grade: {performance_class}")
-    print(f"  Recommendation: {recommendation}")
-    
-    # Station-specific analysis
-    if len(station_metrics) > 0:
-        print(f"\nSpatial Generalization Assessment:")
-        station_r2_values = [metrics['R2'] for metrics in station_metrics.values()]
-        
-        if len(station_r2_values) > 1:
-            r2_mean = np.mean(station_r2_values)
-            r2_std = np.std(station_r2_values)
-            
-            print(f"  Cross-station R² mean: {r2_mean:.3f}")
-            print(f"  Cross-station R² std: {r2_std:.3f}")
-            
-            if r2_std < 0.1:
-                spatial_assessment = "EXCELLENT spatial consistency"
-            elif r2_std < 0.2:
-                spatial_assessment = "GOOD spatial consistency"
-            else:
-                spatial_assessment = "VARIABLE spatial performance"
-            
-            print(f"  Spatial Assessment: {spatial_assessment}")
-        
+    # Station-specific results
+    if station_metrics:
+        print(f"\nSpatial Generalization:")
         for station, metrics in station_metrics.items():
-            print(f"  {station.upper()}:")
-            print(f"    R² = {metrics['R2']:.3f}")
-            print(f"    RMSE = {metrics['RMSE']:.3f}")
-            print(f"    Samples = {metrics['n_samples']}")
+            print(f"  {station}: R² = {metrics['R2']:.3f}, RMSE = {metrics['RMSE']:.3f}")
     
-    # ==============================================
-    # Feature Importance Interpretation
-    # ==============================================
-    
-    print(f"\n{'-'*60}")
-    print("NEURAL NETWORK FEATURE IMPORTANCE RESULTS")
-    print(f"{'-'*60}")
-    
-    # Analyze dominant processes
+    # Process dominance analysis
     thermal_features = ['TC', 'pdd']
     thermal_importance = sum(normalized_importance.get(f, 0) for f in thermal_features)
     precip_importance = normalized_importance.get('snowfall_probability', 0)
     seasonal_importance = normalized_importance.get('day_of_year', 0)
     
-    print(f"Process Dominance Analysis (Neural Network Learning):")
+    print(f"\nProcess Dominance (Neural Network Learning):")
     print(f"  Thermal Processes: {thermal_importance:.1%}")
-    print(f"    - Temperature (TC): {normalized_importance.get('TC', 0):.1%}")
-    print(f"    - Thermal History (PDD): {normalized_importance.get('pdd', 0):.1%}")
     print(f"  Precipitation Processes: {precip_importance:.1%}")
     print(f"  Seasonal Patterns: {seasonal_importance:.1%}")
     
-    # Determine process dominance
-    dominant_process = max([
-        ("Thermal", thermal_importance),
-        ("Precipitation", precip_importance),
-        ("Seasonal", seasonal_importance)
-    ], key=lambda x: x[1])
+    # Determine dominant process
+    dominant = max([("Thermal", thermal_importance), ("Precipitation", precip_importance), 
+                   ("Seasonal", seasonal_importance)], key=lambda x: x[1])
     
-    print(f"\nNeural Network Process Discovery:")
-    print(f"  Dominant Process: {dominant_process[0]} ({dominant_process[1]:.1%})")
+    print(f"  → Neural network identifies {dominant[0]} dominance ({dominant[1]:.1%})")
     
-    if dominant_process[0] == "Thermal":
-        print(f"  → Neural network confirms thermal control of albedo")
-        print(f"  → Temperature and cumulative heating drive albedo changes")
-    elif dominant_process[0] == "Precipitation":
-        print(f"  → Neural network confirms precipitation control of albedo")
-        print(f"  → Snowfall events dominate albedo variability")
-    else:
-        print(f"  → Neural network detects strong seasonal patterns")
-        print(f"  → Cyclical solar/atmospheric forcing is primary driver")
-    
-    # ==============================================
-    # Visualization Generation
-    # ==============================================
-    
+    # Generate visualizations
     print(f"\n{'-'*60}")
     print("GENERATING NEURAL NETWORK VISUALIZATIONS")
     print(f"{'-'*60}")
     
-    # Create comprehensive diagnostic plots
-    print("1. Creating predicted vs. measured scatter plot...")
+    print("Creating predicted vs. measured scatter plot...")
     plot_predicted_vs_measured(y_test_clean, y_pred, test_data_clean)
     
-    print("2. Creating feature importance plot...")
+    print("Creating feature importance plot...")
     plot_feature_importance(feature_importance)
     
-    # Station-specific temporal validation
-    print("3. Creating station-specific time series validations...")
+    print("Creating station-specific time series plots...")
     for station in test_data_clean['station'].unique():
-        print(f"   → Plotting neural network validation for {station.upper()}...")
+        print(f"  Plotting neural network validation for {station}...")
         plot_station_time_series(station, test_data_clean, y_test_clean, y_pred)
     
-    # ==============================================
-    # Model Comparison and Research Insights
-    # ==============================================
-    
+    # Research insights and recommendations
     print(f"\n{'-'*60}")
     print("NEURAL NETWORK RESEARCH INSIGHTS")
     print(f"{'-'*60}")
@@ -1509,116 +861,42 @@ def main():
     print(f"Non-Linear Relationship Assessment:")
     if r2 > 0.7:
         print(f"  ✓ STRONG evidence for complex albedo-meteorology relationships")
-        print(f"  → Neural networks successfully capture non-linear patterns")
-        print(f"  → Justifies advanced machine learning approaches")
+        print(f"  → Neural networks capture significant non-linear patterns")
     elif r2 > 0.5:
         print(f"  ✓ MODERATE evidence for non-linear relationships")
         print(f"  → Neural networks provide meaningful improvements")
-        print(f"  → Consider hybrid linear-nonlinear approaches")
     else:
         print(f"  ⚠ LIMITED evidence for complex relationships")
-        print(f"  → Linear models may be sufficient for this application")
-        print(f"  → Focus on data quality and feature engineering")
+        print(f"  → Linear models may be sufficient")
     
-    print(f"\nComparative Model Analysis:")
-    print(f"  Neural Network R²: {r2:.3f}")
-    print(f"  Baseline comparison needed:")
-    print(f"    - Compare with linear regression results")
-    print(f"    - Calculate improvement over simple models")
-    print(f"    - Assess cost-benefit of model complexity")
-    
-    print(f"\nFeature Learning Insights:")
-    sorted_features = sorted(normalized_importance.items(), key=lambda x: x[1], reverse=True)
-    print(f"  Most important feature: {sorted_features[0][0]} ({sorted_features[0][1]:.1%})")
-    
-    if sorted_features[0][1] > 0.5:
-        print(f"  → Single feature dominance detected")
-        print(f"  → Consider feature-specific modeling approaches")
-    elif sorted_features[0][1] > 0.3:
-        print(f"  → Primary driver identified with supporting features")
-        print(f"  → Balanced multi-feature approach effective")
-    else:
-        print(f"  → Distributed feature importance")
-        print(f"  → Complex multi-variate relationships present")
-    
-    # ==============================================
-    # Research Recommendations
-    # ==============================================
-    
-    print(f"\n{'-'*60}")
-    print("RESEARCH RECOMMENDATIONS")
-    print(f"{'-'*60}")
-    
-    print(f"Neural Network Model Validation:")
+    print(f"\nModel Validation Status:")
     if r2 > 0.6 and len(station_metrics) > 0:
         print(f"  ✓ RECOMMENDED for operational albedo prediction")
         print(f"  → Demonstrates robust non-linear learning capability")
-        print(f"  → Suitable for real-time glacier monitoring applications")
     elif r2 > 0.4:
         print(f"  ✓ PROMISING for research applications")
-        print(f"  → Requires additional validation with more data")
         print(f"  → Consider ensemble approaches with linear models")
     else:
         print(f"  ⚠ REQUIRES FURTHER DEVELOPMENT")
         print(f"  → Investigate data quality and feature engineering")
-        print(f"  → Consider alternative neural network architectures")
     
-    print(f"\nFuture Research Directions:")
-    print(f"  1. Multi-station neural network training for improved generalization")
-    print(f"  2. Temporal sequence modeling (LSTM/RNN) for time-series patterns")
+    print(f"\nResearch Recommendations:")
+    print(f"  1. Compare directly with linear regression baselines")
+    print(f"  2. Multi-station training for improved generalization")
     print(f"  3. Ensemble methods combining neural networks with linear models")
-    print(f"  4. Physics-informed neural networks incorporating energy balance")
-    print(f"  5. Uncertainty quantification for neural network predictions")
+    print(f"  4. Temporal sequence modeling (LSTM/RNN) for time-series")
+    print(f"  5. Physics-informed neural networks with energy balance")
     
     print(f"\nPublication Considerations:")
     print(f"  • Emphasize non-linear relationship discovery capabilities")
     print(f"  • Compare performance improvements over linear baselines")
     print(f"  • Discuss computational requirements vs. accuracy trade-offs")
     print(f"  • Address interpretability through permutation importance")
-    print(f"  • Highlight spatial generalization across glacier sites")
     
-    print(f"\nOperational Applications:")
-    print(f"  • Real-time albedo forecasting for glacier monitoring")
-    print(f"  • Early warning systems for rapid albedo changes")
-    print(f"  • Integration with satellite remote sensing validation")
-    print(f"  • Climate model parameterization improvement")
-    print(f"  • Arctic research station automated analysis")
-    
-    print(f"\n{'='*80}")
+    print(f"\n{'='*70}")
     print(f"Neural network analysis completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*80}")
-
-
-# ==============================================
-# Script Execution Entry Point
-# ==============================================
+    print(f"{'='*70}")
 
 if __name__ == "__main__":
-    """
-    Execute the complete neural network albedo prediction analysis.
-    
-    This script provides a state-of-the-art machine learning approach to glacier
-    albedo prediction, complementing traditional linear methods with advanced
-    non-linear modeling capabilities. The analysis is designed for scientific
-    publication and provides comprehensive validation of neural network approaches
-    for glaciological applications.
-    
-    Usage Options:
-    1. Direct execution: python mlp_albedo_model.py
-    2. Module import: from mlp_albedo_model import main, train_and_evaluate_mlp
-    3. Integration: Use individual functions in larger analysis pipelines
-    4. Hyperparameter tuning: Set optimize_hyperparams = True in main()
-    
-    Output:
-    - Comprehensive neural network performance assessment
-    - Publication-ready visualizations and diagnostic plots
-    - Feature importance analysis with statistical validation
-    - Detailed recommendations for model selection and future research
-    - Comparative framework for linear vs. non-linear model evaluation
-    
-    Computational Requirements:
-    - Training time: 30-120 seconds depending on dataset size
-    - Memory usage: Moderate (suitable for standard research computers)
-    - Hyperparameter optimization: 5-10 minutes (optional, high accuracy)
-    """
+    """Execute complete neural network albedo prediction analysis."""
     main()
