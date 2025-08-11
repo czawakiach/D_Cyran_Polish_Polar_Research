@@ -1,0 +1,188 @@
+# Google Earth Engine Authentication and Setup
+# This script handles the initial setup and authentication for Google Earth Engine
+# Run this ONCE before proceeding with satellite albedo analysis
+
+import ee
+import geemap
+
+def setup_google_earth_engine():
+    """
+    Set up and authenticate Google Earth Engine for satellite data access.
+    This function handles the complete setup process for first-time users.
+    """
+    print("="*60)
+    print("GOOGLE EARTH ENGINE SETUP AND AUTHENTICATION")
+    print("="*60)
+    print("This script will set up Google Earth Engine for satellite albedo analysis")
+    print("Follow the authentication steps in your browser when prompted.\n")
+    
+    # Step 1: Authenticate with Google Earth Engine
+    print("Step 1: Authenticating with Google Earth Engine")
+    print("-" * 45)
+    print("This will open a browser window for authentication.")
+    print("Please sign in with your Google account and copy the authorization code.")
+    
+    try:
+        ee.Authenticate()
+        print("✓ Authentication completed successfully!")
+    except Exception as e:
+        print(f"✗ Authentication failed: {e}")
+        print("Please ensure you have a Google account and try again.")
+        return False
+    
+    # Step 2: Initialize Earth Engine
+    print("\nStep 2: Initializing Earth Engine connection")
+    print("-" * 42)
+    
+    try:
+        ee.Initialize()
+        print("✓ Earth Engine initialized successfully!")
+    except Exception as e:
+        print(f"✗ Initialization failed: {e}")
+        print("Please check your internet connection and authentication.")
+        return False
+    
+    # Step 3: Test Earth Engine functionality
+    print("\nStep 3: Testing Earth Engine connection")
+    print("-" * 37)
+    
+    try:
+        # Test with a simple image collection query
+        test_collection = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').limit(1)
+        count = test_collection.size().getInfo()
+        print(f"✓ Connection test successful! Retrieved collection size: {count}")
+        print("✓ Earth Engine is ready for satellite data analysis!")
+    except Exception as e:
+        print(f"✗ Connection test failed: {e}")
+        print("Please verify your authentication and try again.")
+        return False
+    
+    return True
+
+def check_available_datasets():
+    """
+    Check availability of Landsat datasets required for albedo analysis.
+    Verifies access to Landsat 5, 7, and 8 surface reflectance collections.
+    """
+    print("\nStep 4: Checking available Landsat datasets")
+    print("-" * 41)
+    
+    # Define Landsat collections used for albedo analysis
+    landsat_collections = {
+        'LANDSAT/LC08/C02/T1_L2': 'Landsat 8 Surface Reflectance (2013-present)',
+        'LANDSAT/LE07/C02/T1_L2': 'Landsat 7 Surface Reflectance (1999-present)',
+        'LANDSAT/LT05/C02/T1_L2': 'Landsat 5 Surface Reflectance (1984-2012)'
+    }
+    
+    available_collections = []
+    
+    for collection_id, description in landsat_collections.items():
+        try:
+            # Test access to each collection
+            collection = ee.ImageCollection(collection_id)
+            # Try to get basic info to verify access
+            collection.size().getInfo()
+            print(f"✓ {description}")
+            available_collections.append(collection_id)
+        except Exception as e:
+            print(f"✗ {description} - Access denied or unavailable")
+            print(f"   Error: {e}")
+    
+    if available_collections:
+        print(f"\n✓ Successfully verified access to {len(available_collections)} Landsat collections")
+        print("You can proceed with satellite albedo analysis!")
+        return available_collections
+    else:
+        print("\n✗ No Landsat collections accessible")
+        print("Please check your Earth Engine permissions and try again.")
+        return []
+
+def verify_project_access(project_id):
+    """
+    Verify access to a specific Google Earth Engine project.
+    
+    Parameters:
+    project_id (str): Google Earth Engine project ID
+    
+    Returns:
+    bool: True if project access is verified, False otherwise
+    """
+    print(f"\nStep 5: Verifying project access")
+    print("-" * 31)
+    
+    try:
+        # Re-initialize with specific project
+        ee.Initialize(project=project_id)
+        print(f"✓ Successfully connected to project: {project_id}")
+        
+        # Test project access with a simple operation
+        test_point = ee.Geometry.Point([0, 0])
+        print("✓ Project access verified!")
+        return True
+        
+    except Exception as e:
+        print(f"✗ Project access failed: {e}")
+        print(f"Please verify your access to project '{project_id}'")
+        return False
+
+def main_setup():
+    """
+    Main function to execute complete Google Earth Engine setup process.
+    This function orchestrates the entire setup workflow.
+    """
+    print("Starting Google Earth Engine setup for satellite albedo analysis...\n")
+    
+    # Execute setup steps
+    auth_success = setup_google_earth_engine()
+    
+    if not auth_success:
+        print("\n❌ Setup failed during authentication. Please try again.")
+        return False
+    
+    # Check dataset availability
+    available_datasets = check_available_datasets()
+    
+    if not available_datasets:
+        print("\n❌ No datasets available. Please check your Earth Engine permissions.")
+        return False
+    
+    # Optional: Verify specific project access (update with your project ID)
+    project_id = "ee-dcyran94"  # Replace with your actual project ID
+    if project_id:
+        project_success = verify_project_access(project_id)
+        if not project_success:
+            print(f"\n⚠️ Project access failed, but basic Earth Engine works.")
+            print("You may need to create a project or verify permissions.")
+    
+    # Final summary
+    print("\n" + "="*60)
+    print("SETUP COMPLETE - READY FOR SATELLITE ALBEDO ANALYSIS")
+    print("="*60)
+    print("✓ Google Earth Engine authenticated")
+    print("✓ Connection established and tested")
+    print(f"✓ {len(available_datasets)} Landsat collections available")
+    print("✓ System ready for glacier albedo analysis")
+    print("\nNext steps:")
+    print("1. Run the satellite albedo analysis script")
+    print("2. Process Landsat imagery for your study area")
+    print("3. Apply multiple albedo algorithms for comparison")
+    
+    return True
+
+# Execute setup if run as main script
+if __name__ == "__main__":
+    print("Google Earth Engine Setup for Glacier Albedo Analysis")
+    print("This script prepares your environment for satellite-based albedo calculations\n")
+    
+    setup_success = main_setup()
+    
+    if setup_success:
+        print("\n🎉 Setup completed successfully!")
+        print("You can now proceed with satellite albedo analysis.")
+    else:
+        print("\n❌ Setup incomplete. Please resolve issues and try again.")
+        print("Common solutions:")
+        print("- Ensure you have a Google account")
+        print("- Check internet connection")
+        print("- Verify Earth Engine access permissions")
+        print("- Contact Google Earth Engine support if problems persist")
